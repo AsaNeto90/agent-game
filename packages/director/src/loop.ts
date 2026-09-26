@@ -279,22 +279,27 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
     });
 
     // 5. L2 heartbeat, slow cadence: the agent comments on the fight.
+    // Fire-and-forget: a slow vendor must never stall the 4Hz tick loop.
     if (tick % 40 === 0 && situation !== "agent down") {
-      const line = await cfg.mind.speak(
-        {
-          agentName: agent.name,
-          agentExt: agent.ext,
-          bondTier: agent.bondTier,
-          recentMemories: [],
-          situation,
-        },
-        "battle banter",
-      );
-      await convex.mutation(api.session.pushEvent, {
-        sessionId,
-        tick,
-        event: { type: "dialogue", speaker: `${agent.name}.${agent.ext}`, text: line },
-      });
+      cfg.mind
+        .speak(
+          {
+            agentName: agent.name,
+            agentExt: agent.ext,
+            bondTier: agent.bondTier,
+            recentMemories: [],
+            situation,
+          },
+          "battle banter",
+        )
+        .then((line) =>
+          convex.mutation(api.session.pushEvent, {
+            sessionId,
+            tick,
+            event: { type: "dialogue", speaker: `${agent.name}.${agent.ext}`, text: line },
+          }),
+        )
+        .catch(() => {});
     }
 
   }, TICK_MS);

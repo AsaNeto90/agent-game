@@ -67,6 +67,11 @@ console.log(JSON.stringify({ scripts: STARTER_SCRIPTS.map(({id,name,category,ele
   melee + ranged) → snapshot write → event feed → decision traces.
 - Operator verbs: command, slot script, chat. Synchro + energy modeled.
 - MockMind: deterministic, $0. Every test runs on it.
+- VendorMind: a real LLM behind `MindProvider` (OpenAI-compatible shape —
+  works with Gemini, Ollama, LM Studio, OpenAI...). Set `MIND_PROVIDER=gemini`
+  with a free `GEMINI_API_KEY` from https://aistudio.google.com/apikey and the
+  agent starts thinking for real. Any vendor failure falls back to MockMind,
+  so a dead API never kills a dive.
 - Client: Three.js dive view with interpolated 60fps rendering, HUD with
   command buttons / script slots / chat / synchro bar / dialogue feed.
 - Tests: `pnpm --filter @agent-game/director test` (vitest — sim invariants,
@@ -74,8 +79,6 @@ console.log(JSON.stringify({ scripts: STARTER_SCRIPTS.map(({id,name,category,ele
 
 ## What's stubbed (by design)
 
-- `VendorMind` — the real LLM provider behind `MindProvider`. Add it when
-  the loop is fun on MockMind. Env var picks the vendor.
 - Bond XP awards on battle end, virus drops → fragments, compile/shatter UI.
 - Style vector updates from play history (schema is ready).
 - Auth (single local operator), multiplayer, trading, tournaments.

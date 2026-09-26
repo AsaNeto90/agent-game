@@ -8,7 +8,8 @@
  *   npx convex run agents:compile '{"name":"AstroMan","ext":"PY"}'
  */
 import "dotenv/config";
-import { MockMind } from "./mind.js";
+import { MockMind, type MindProvider } from "./mind.js";
+import { vendorMindFromEnv } from "./vendor.js";
 import { runDirector } from "./loop.js";
 
 const convexUrl = process.env.CONVEX_URL;
@@ -20,9 +21,10 @@ if (!convexUrl || !agentId) {
   process.exit(1);
 }
 
-// MindProvider is the seam: MockMind today ($0, deterministic),
-// VendorMind tomorrow (env var picks the vendor — chase prices forever).
-const mind = new MockMind();
+// MindProvider is the seam: MockMind by default ($0, deterministic).
+// Set MIND_PROVIDER=gemini (free AI Studio key) or =openai-compatible
+// to give the agent a real brain — chase prices forever.
+const mind: MindProvider = vendorMindFromEnv() ?? new MockMind();
 
 console.log(`[director] diving ${agentId} into ${zoneId} with mind=${mind.name}`);
 const stop = await runDirector({ convexUrl, agentId, zoneId, mind });

@@ -26,6 +26,8 @@ export interface MindProvider {
   readonly name: string;
   decide(ctx: MindContext): Promise<MindDecision>;
   speak(ctx: MindContext, prompt: string): Promise<string>;
+  /** Tokens burned by the most recent call — the flight recorder reads this. */
+  readonly lastTokens: number;
 }
 
 /**
@@ -34,6 +36,7 @@ export interface MindProvider {
  */
 export class MockMind implements MindProvider {
   readonly name = "mock";
+  readonly lastTokens = 0;
   private n = 0;
 
   async decide(ctx: MindContext): Promise<MindDecision> {
@@ -111,11 +114,24 @@ export class MockMind implements MindProvider {
   }
 }
 
-/** Rough cost model so traces carry costUsd even for mock (always 0). */
+/**
+ * Rough cost model for the flight recorder. Mock is always 0; vendor rates
+ * are blended $/1M-token estimates (input+output averaged) — honest enough
+ * for a prototype, real per-token accounting comes with the economy design.
+ */
+const BLENDED_USD_PER_MTOKENS: Record<string, number> = {
+  mock: 0,
+  gemini: 1.4, // ~gemini-3.8-flash paid tier, blended in/out
+  "openai-compatible": 3, // placeholder — set MIND_USD_PER_MTOKENS to override
+};
+
 export function estimateCostUsd(provider: string, tokens: number): number {
-  if (provider === "mock") return 0;
-  // Placeholder blended rate — replaced by per-vendor accounting later.
-  return (tokens / 1_000_000) * 3;
+  const override = Number(process.env.MIND_USD_PER_MTOKENS);
+  const rate =
+    Number.isFinite(override) && override > 0
+      ? override
+      : (BLENDED_USD_PER_MTOKENS[provider] ?? BLENDED_USD_PER_MTOKENS["openai-compatible"]!);
+  return (tokens / 1_000_000) * rate;
 }
 
 export type { Element };
