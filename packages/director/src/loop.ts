@@ -6,7 +6,7 @@ import { ConvexHttpClient } from "convex/browser";
 import { api } from "../../../convex/_generated/api.js";
 import type { Id } from "../../../convex/_generated/dataModel.js";
 import { MockMind, estimateCostUsd, type MindProvider } from "./mind.js";
-import { applyScript, rng, tickWorld, type Fighter, type WorldState } from "./world.js";
+import { applyScript, rng, spawnWave, tickWorld, type Fighter, type WorldState } from "./world.js";
 import type { Element } from "@agent-game/shared";
 
 const TICK_MS = 250;
@@ -51,8 +51,8 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
     name: `${agent.name}.${agent.ext}`,
     pos: { x: 0, y: 0, z: 0 },
     pose: "idle",
-    hp: 100,
-    maxHp: 100,
+    hp: 120,
+    maxHp: 120,
     element: agent.element as Fighter["element"],
     cooldown: 0,
   });
@@ -81,6 +81,8 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
   let directive: "engage" | "disengage" | "hold" | "focus_weakest" | "protect" = "engage";
   let targetElement: Element | null = null;
   let lastOperatorTick = -1000; // banter stays quiet right after a conversation
+  let wave = 1; // the opening pair is wave 1; clears escalate from here
+  let respawnAt: number | null = null; // tick when the next wave drops
   let running = true;
 
   /** Map operator words to a battle directive. */
@@ -92,13 +94,13 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
     if (/protect|guard|cover/.test(t)) return "protect" as const;
     return "engage" as const;
   };
-  /** "hit the acqua" should mean the aqua virus. */
+  /** "hit the acqua" should mean the aqua virus. Colors work too. */
   const parseElement = (text: string): Element | null => {
     const t = text.toLowerCase();
-    if (/acqua|aqua|water/.test(t)) return "aqua";
-    if (/fire|flame|burn|cinder/.test(t)) return "fire";
-    if (/elec|electric|thunder|volt|arc/.test(t)) return "elec";
-    if (/wood|leaf|vine/.test(t)) return "wood";
+    if (/acqua|aqua|water|blue/.test(t)) return "aqua";
+    if (/fire|flame|burn|cinder|red/.test(t)) return "fire";
+    if (/elec|electric|thunder|volt|arc|yellow/.test(t)) return "elec";
+    if (/wood|leaf|vine|green/.test(t)) return "wood";
     return null;
   };
   /** Fire-and-forget agent line — a slow mind must never stall the 4Hz loop. */
@@ -269,6 +271,59 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
           },
         });
       }
+    }
+
+    // 2b. Wave control: clears escalate, death ends the dive.
+    const agentAlive = (world.fighters.find((f) => f.kind === "agent")?.hp ?? 0) > 0;
+    const virusesAlive = world.fighters.filter((f) => f.kind === "virus" && f.hp > 0).length;
+    if (!agentAlive) {
+      await convex.mutation(api.session.pushEvent, {
+        sessionId,
+        tick,
+        event: {
+          type: "dialogue",
+          speaker: `${agent.name}.${agent.ext}`,
+          text: `I'm down... jack me out, operator. We'll get them next time.`,
+        },
+      });
+      await convex.mutation(api.session.rest, { sessionId });
+      clearInterval(timer);
+      running = false;
+      console.log("[director] agent down — dive over. Surfacing.");
+      setTimeout(() => process.exit(0), 500);
+      return;
+    }
+    if (virusesAlive === 0 && respawnAt === null) {
+      // Breather: the next wave drops in 5 seconds.
+      respawnAt = tick + 20;
+      const a = world.fighters.find((f) => f.kind === "agent")!;
+      a.hp = Math.min(a.maxHp, a.hp + 25); // catch your breath between waves
+      synchro = Math.min(100, synchro + 10);
+      await convex.mutation(api.session.pushEvent, {
+        sessionId,
+        tick,
+        event: {
+          type: "dialogue",
+          speaker: `${agent.name}.${agent.ext}`,
+          text: `Wave ${wave} cleared — nice coaching, operator. Catch your breath.`,
+        },
+      });
+      await trace("L1", `wave_cleared:${wave}`, `${wave} down, next incoming`, 1);
+    } else if (respawnAt !== null && tick >= respawnAt) {
+      respawnAt = null;
+      wave++;
+      spawnWave(world, wave, rand);
+      const count = Math.min(1 + wave, 6);
+      await convex.mutation(api.session.pushEvent, {
+        sessionId,
+        tick,
+        event: {
+          type: "dialogue",
+          speaker: `${agent.name}.${agent.ext}`,
+          text: `Wave ${wave} incoming — ${count} viruses on the scope. Stay sharp!`,
+        },
+      });
+      await trace("L1", `wave_start:${wave}`, `${count} viruses spawned`, 1);
     }
 
     // 3. Energy — the fiction-coherent session clock.

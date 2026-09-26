@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { elementMultiplier, rangeBandOf } from "@agent-game/shared";
-import { applyScript, rng, tickWorld, type WorldState } from "./world.js";
+import { applyScript, rng, spawnWave, tickWorld, type WorldState } from "./world.js";
 
 describe("element matchups", () => {
   it("fire beats wood, wood resists fire", () => {
@@ -184,5 +184,105 @@ describe("shields and script effects", () => {
     expect(applyScript(w, "nope")).toBeNull();
     expect(applyScript(w, "overclock")).toBeNull(); // buff: flavor-only in v1
     expect(w.events).toHaveLength(0);
+  });
+});
+
+describe("waves", () => {
+  const mkWorld = (): WorldState => ({
+    fighters: [
+      {
+        id: "a",
+        kind: "agent",
+        name: "Test.PY",
+        pos: { x: 0, y: 0, z: 0 },
+        pose: "idle",
+        hp: 100,
+        maxHp: 100,
+        element: "null",
+        cooldown: 0,
+      },
+    ],
+    events: [],
+  });
+
+  it("spawnWave adds escalating virus counts with scaled hp", () => {
+    const w2 = mkWorld();
+    spawnWave(w2, 2, rng(1));
+    expect(w2.fighters.filter((f) => f.kind === "virus")).toHaveLength(3);
+    expect(w2.fighters.find((f) => f.kind === "virus")!.hp).toBe(60);
+
+    const w5 = mkWorld();
+    spawnWave(w5, 5, rng(1));
+    const viruses = w5.fighters.filter((f) => f.kind === "virus");
+    expect(viruses).toHaveLength(6); // capped
+    expect(viruses[0].hp).toBe(90);
+  });
+
+  it("spawnWave clears corpses from earlier waves", () => {
+    const w = mkWorld();
+    w.fighters.push({
+      id: "virus-old",
+      kind: "virus",
+      name: "Dead",
+      pos: { x: 5, y: 0, z: 0 },
+      pose: "down",
+      hp: 0,
+      maxHp: 40,
+      element: "aqua",
+      cooldown: 0,
+    });
+    spawnWave(w, 2, rng(1));
+    expect(w.fighters.some((f) => f.id === "virus-old")).toBe(false);
+    expect(w.fighters.filter((f) => f.kind === "virus" && f.hp > 0)).toHaveLength(3);
+  });
+});
+
+describe("wind-up telegraphs", () => {
+  const mkDuel = () => {
+    const w: WorldState = {
+      fighters: [
+        { id: "a", kind: "agent", name: "Test.PY", pos: { x: 0, y: 0, z: 0 }, pose: "idle", hp: 100, maxHp: 100, element: "null", cooldown: 0 },
+        { id: "v", kind: "virus", name: "V", pos: { x: 1, y: 0, z: 0 }, pose: "idle", hp: 40, maxHp: 40, element: "null", cooldown: 0, aggression: 1 },
+      ],
+      events: [],
+    };
+    return w;
+  };
+  const hits = (w: WorldState) => w.events.filter((e) => e.type === "hit");
+
+  it("virus telegraphs instead of striking instantly", () => {
+    const w = mkDuel();
+    tickWorld(w, 0.25, "hold", rng(7));
+    const v = w.fighters[1];
+    expect(v.pose).toBe("windup");
+    expect(v.windup).toBeGreaterThan(0);
+    expect(hits(w)).toHaveLength(0); // no damage yet — the operator gets a reaction window
+  });
+
+  it("wind-up completes into a strike when the target holds still", () => {
+    const w = mkDuel();
+    const r = rng(7);
+    for (let i = 0; i < 4; i++) tickWorld(w, 0.25, "hold", r);
+    expect(hits(w)).toHaveLength(1);
+    expect(w.fighters[0].hp).toBe(94); // VIRUS_POWER = 6, null vs null
+  });
+
+  it("kiting out of range during wind-up dodges the strike", () => {
+    const w = mkDuel();
+    const r = rng(7);
+    tickWorld(w, 0.25, "hold", r); // wind-up starts
+    w.fighters[0].pos.x = 50; // operator shouted "fall back!"
+    for (let i = 0; i < 3; i++) tickWorld(w, 0.25, "hold", r);
+    expect(hits(w)).toHaveLength(0);
+    expect(w.fighters[0].hp).toBe(100);
+  });
+
+  it("killing the virus mid-wind-up cancels its attack", () => {
+    const w = mkDuel();
+    const r = rng(7);
+    tickWorld(w, 0.25, "hold", r); // wind-up starts
+    w.fighters[1].hp = 0; // interrupted
+    for (let i = 0; i < 3; i++) tickWorld(w, 0.25, "hold", r);
+    expect(hits(w)).toHaveLength(0);
   });
 });

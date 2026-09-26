@@ -124,6 +124,7 @@ export const Pose = z.enum([
   "idle",
   "run",
   "dash",
+  "windup",
   "melee_attack",
   "ranged_attack",
   "cast",

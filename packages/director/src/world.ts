@@ -29,6 +29,12 @@ export interface Fighter {
   aggression?: number;
   /** barrier hp from ward scripts — absorbs damage before hp */
   shield?: number;
+  /**
+   * seconds left in an attack wind-up. While winding up the fighter is
+   * committed: the strike lands when it hits 0, but only if the target is
+   * still in range — kiting out dodges it, killing the attacker cancels it.
+   */
+  windup?: number;
 }
 
 export interface WorldState {
@@ -58,6 +64,9 @@ const dist = (a: Vec3, b: Vec3) =>
 const MELEE_POWER = 10;
 const RANGED_POWER = 7;
 const ATTACK_COOLDOWN = 1.2; // seconds
+const WINDUP_TIME = 0.75; // seconds of telegraph before a virus strike lands
+const VIRUS_POWER = 6; // viruses hit softer than the agent — the operator's job is coaching, not tanking
+const VIRUS_COOLDOWN = 2.4; // seconds between virus swings (plus wind-up)
 const MOVE_SPEED = 3.2; // m/s
 
 /**
@@ -131,14 +140,29 @@ export function tickWorld(
     agent.pose = "idle";
   }
 
-  // --- Virus L0: drift toward the agent, swipe in melee ---
+  // --- Virus L0: drift toward the agent, telegraph, then swipe in melee ---
   for (const v of viruses) {
     const d = dist(v.pos, agent.pos);
-    if (rangeBandOf(d) === "melee") {
-      v.pose = "melee_attack";
+    if (v.windup != null && v.windup > 0) {
+      // Committed to the swing: the strike lands when the wind-up ends,
+      // but only if the target is still in reach.
+      v.windup -= dt;
+      v.pose = "windup";
+      if (v.windup <= 0) {
+        v.windup = 0;
+        if (agent.hp > 0 && rangeBandOf(dist(v.pos, agent.pos)) === "melee") {
+          strike(state, v, agent, VIRUS_POWER * elementMultiplier(v.element, agent.element));
+        } else {
+          v.pose = "idle"; // whiffed — the operator kited it out
+        }
+        v.cooldown = VIRUS_COOLDOWN;
+      }
+    } else if (rangeBandOf(d) === "melee") {
       if (v.cooldown <= 0 && rand() < (v.aggression ?? 0.6)) {
-        strike(state, v, agent, MELEE_POWER * 0.8 * elementMultiplier(v.element, agent.element));
-        v.cooldown = ATTACK_COOLDOWN * 1.4;
+        v.windup = WINDUP_TIME;
+        v.pose = "windup";
+      } else {
+        v.pose = "melee_attack";
       }
     } else {
       moveToward(v, agent.pos, dt * 0.8);
@@ -238,6 +262,46 @@ export function applyScript(
     default:
       // buff / summon / terrain / phase: no L0 mechanics in v1 yet.
       return null;
+  }
+}
+
+/**
+ * Spawn a wave of viruses around the agent. Wave 1 is the dive's opening
+ * pair; later waves get more numerous, tougher, and meaner. Corpses from
+ * earlier waves are cleared.
+ */
+const VIRUS_POOL: { name: string; element: Element }[] = [
+  { name: "Scrapbit", element: "aqua" },
+  { name: "Glitchwasp", element: "elec" },
+  { name: "Cindercub", element: "fire" },
+  { name: "Mossmite", element: "wood" },
+  { name: "Frostmite", element: "aqua" },
+  { name: "Voltvulture", element: "elec" },
+];
+
+export function spawnWave(state: WorldState, wave: number, rand: () => number): void {
+  state.fighters = state.fighters.filter((f) => f.kind === "agent" || f.hp > 0);
+  const agent = state.fighters.find((f) => f.kind === "agent");
+  const ax = agent?.pos.x ?? 0;
+  const az = agent?.pos.z ?? 0;
+  const count = Math.min(1 + wave, 6);
+  const hp = 40 + wave * 10;
+  for (let i = 0; i < count; i++) {
+    const def = VIRUS_POOL[(wave + i) % VIRUS_POOL.length];
+    const angle = rand() * Math.PI * 2;
+    const d = 7 + rand() * 4;
+    state.fighters.push({
+      id: `virus-w${wave}-${i}`,
+      kind: "virus",
+      name: def.name,
+      pos: { x: ax + Math.cos(angle) * d, y: 0, z: az + Math.sin(angle) * d },
+      pose: "idle",
+      hp,
+      maxHp: hp,
+      element: def.element,
+      cooldown: 0,
+      aggression: Math.min(0.6 + wave * 0.1, 0.95),
+    });
   }
 }
 
