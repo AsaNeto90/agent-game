@@ -191,3 +191,6 @@ export const DecisionTrace = z.object({
   rationale: z.string(),
 });
 export type DecisionTrace = z.infer<typeof DecisionTrace>;
+
+/** The 12-Script Starter Kit every new operator gets. */
+export { STARTER_SCRIPTS } from "./starter-scripts.js";

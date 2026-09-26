@@ -90,8 +90,13 @@ describe("VendorMind", () => {
     expect(line).not.toMatch(/Third sentence/);
   });
 
-  it("constructor refuses to run without a key", () => {
-    expect(() => new VendorMind({ apiKey: "" })).toThrow(/apiKey/);
+  it("omits the Authorization header when constructed without a key (local Ollama)", async () => {
+    const fetchFn = fakeFetch(chatBody("local brain online"));
+    const mind = new VendorMind({ ...opts(fetchFn, "http://localhost:11434/v1"), apiKey: "" });
+    const line = await mind.speak(ctx, "hello");
+    expect(line).toBe("local brain online");
+    const [, init] = (fetchFn.mock.calls as unknown as [string, RequestInit][])[0];
+    expect(init.headers).not.toHaveProperty("authorization");
   });
 
   it("tolerates a base URL with /chat/completions already appended", async () => {
@@ -110,5 +115,72 @@ describe("VendorMind", () => {
     await mind.speak(ctx, "hello");
     const [url] = (fetchFn.mock.calls as unknown as [string, RequestInit][])[0];
     expect(url).toBe("https://example.test/v1/chat/completions");
+  });
+});
+
+describe("MIND_THINK", () => {
+  const withEnv = async (value: string | undefined, fn: () => Promise<void>) => {
+    const prev = process.env.MIND_THINK;
+    if (value === undefined) delete process.env.MIND_THINK;
+    else process.env.MIND_THINK = value;
+    try {
+      await fn();
+    } finally {
+      if (prev === undefined) delete process.env.MIND_THINK;
+      else process.env.MIND_THINK = prev;
+    }
+  };
+
+  const bodyOf = (fetchFn: ReturnType<typeof fakeFetch>) => {
+    const [, init] = (fetchFn.mock.calls as unknown as [string, RequestInit][])[0];
+    return JSON.parse(init.body as string);
+  };
+
+  it("sends think:false when MIND_THINK=false (Qwen3 on Ollama)", async () => {
+    await withEnv("false", async () => {
+      const fetchFn = fakeFetch(chatBody("quick answer"));
+      const mind = new VendorMind(opts(fetchFn));
+      await mind.speak(ctx, "hello");
+      expect(bodyOf(fetchFn)).toMatchObject({ think: false });
+    });
+  });
+
+  it("omits think when MIND_THINK is unset", async () => {
+    await withEnv(undefined, async () => {
+      const fetchFn = fakeFetch(chatBody("quick answer"));
+      const mind = new VendorMind(opts(fetchFn));
+      await mind.speak(ctx, "hello");
+      expect(bodyOf(fetchFn)).not.toHaveProperty("think");
+    });
+  });
+});
+
+describe("MIND_TIMEOUT_MS", () => {
+  const withEnv = async (value: string | undefined, fn: () => Promise<void>) => {
+    const prev = process.env.MIND_TIMEOUT_MS;
+    if (value === undefined) delete process.env.MIND_TIMEOUT_MS;
+    else process.env.MIND_TIMEOUT_MS = value;
+    try {
+      await fn();
+    } finally {
+      if (prev === undefined) delete process.env.MIND_TIMEOUT_MS;
+      else process.env.MIND_TIMEOUT_MS = prev;
+    }
+  };
+
+  it("uses MIND_TIMEOUT_MS for the abort signal when set", async () => {
+    await withEnv("60000", async () => {
+      const { timeoutMs: _ignored, ...noTimeout } = opts(fakeFetch(chatBody("hi")));
+      const mind = new VendorMind(noTimeout);
+      expect((mind as unknown as { timeoutMs: number }).timeoutMs).toBe(60000);
+    });
+  });
+
+  it("defaults to 30s when MIND_TIMEOUT_MS is unset", async () => {
+    await withEnv(undefined, async () => {
+      const { timeoutMs: _ignored, ...noTimeout } = opts(fakeFetch(chatBody("hi")));
+      const mind = new VendorMind(noTimeout);
+      expect((mind as unknown as { timeoutMs: number }).timeoutMs).toBe(30_000);
+    });
   });
 });

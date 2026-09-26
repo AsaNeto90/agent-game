@@ -6,7 +6,8 @@ import { ConvexHttpClient } from "convex/browser";
 import { api } from "../../../convex/_generated/api.js";
 import type { Id } from "../../../convex/_generated/dataModel.js";
 import { MockMind, estimateCostUsd, type MindProvider } from "./mind.js";
-import { rng, tickWorld, type Fighter, type WorldState } from "./world.js";
+import { applyScript, rng, tickWorld, type Fighter, type WorldState } from "./world.js";
+import type { Element } from "@agent-game/shared";
 
 const TICK_MS = 250;
 const ENERGY_DRAIN_PER_TICK = 0.08; // ~100 energy ≈ 5 min of diving
@@ -78,7 +79,50 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
   let energy = agent.energy;
   let synchro = 50;
   let directive: "engage" | "disengage" | "hold" | "focus_weakest" | "protect" = "engage";
+  let targetElement: Element | null = null;
+  let lastOperatorTick = -1000; // banter stays quiet right after a conversation
   let running = true;
+
+  /** Map operator words to a battle directive. */
+  const parseDirective = (text: string) => {
+    const t = text.toLowerCase();
+    if (/retreat|fall back|disengage/.test(t)) return "disengage" as const;
+    if (/hold|wait|steady/.test(t)) return "hold" as const;
+    if (/focus|weakest|thin/.test(t)) return "focus_weakest" as const;
+    if (/protect|guard|cover/.test(t)) return "protect" as const;
+    return "engage" as const;
+  };
+  /** "hit the acqua" should mean the aqua virus. */
+  const parseElement = (text: string): Element | null => {
+    const t = text.toLowerCase();
+    if (/acqua|aqua|water/.test(t)) return "aqua";
+    if (/fire|flame|burn|cinder/.test(t)) return "fire";
+    if (/elec|electric|thunder|volt|arc/.test(t)) return "elec";
+    if (/wood|leaf|vine/.test(t)) return "wood";
+    return null;
+  };
+  /** Fire-and-forget agent line — a slow mind must never stall the 4Hz loop. */
+  const sayAsync = (situation: string, prompt: string) => {
+    cfg.mind
+      .speak(
+        {
+          agentName: agent.name,
+          agentExt: agent.ext,
+          bondTier: agent.bondTier,
+          recentMemories: [],
+          situation,
+        },
+        prompt,
+      )
+      .then((line) =>
+        convex.mutation(api.session.pushEvent, {
+          sessionId,
+          tick,
+          event: { type: "dialogue", speaker: `${agent.name}.${agent.ext}`, text: line },
+        }),
+      )
+      .catch(() => {});
+  };
 
   const trace = async (
     level: "L0" | "L1" | "L2",
@@ -145,47 +189,12 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
     for (const intent of intents) {
       const p = intent.payload as Record<string, string>;
       if (intent.type === "command") {
-        const text = (p.text ?? "").toLowerCase();
-        if (/retreat|fall back|disengage/.test(text)) directive = "disengage";
-        else if (/hold|wait|steady/.test(text)) directive = "hold";
-        else if (/focus|weakest|thin/.test(text)) directive = "focus_weakest";
-        else directive = "engage";
-        synchro = Math.min(100, synchro + 2); // good coaching nudges synchro up
-        // The operator's words appear in the feed — a dialogue needs both sides.
-        if ((p.text ?? "").trim()) {
-          await convex.mutation(api.session.pushEvent, {
-            sessionId,
-            tick,
-            event: { type: "dialogue", speaker: "OPERATOR", text: p.text as string },
-          });
-        }
-        // The operator's words get an answer — commands are visible in the feed.
-        const ack = await cfg.mind.speak(
-          {
-            agentName: agent.name,
-            agentExt: agent.ext,
-            bondTier: agent.bondTier,
-            recentMemories: [],
-            situation: `operator command: ${p.text}`,
-          },
-          `operator command: ${p.text}`,
-        );
-        await convex.mutation(api.session.pushEvent, {
-          sessionId,
-          tick,
-          event: { type: "dialogue", speaker: `${agent.name}.${agent.ext}`, text: ack },
-        });
-        await trace("L1", `command:${directive}`, `operator said "${p.text}"`, Date.now() - t0);
-      } else if (intent.type === "slot_script") {
-        synchro = Math.min(100, synchro + 4);
-        await convex.mutation(api.session.pushEvent, {
-          sessionId,
-          tick,
-          event: { type: "script_fired", scriptId: p.scriptId, byId: `agent-${agent._id}` },
-        });
-        await trace("L1", `slot_script:${p.scriptId}`, "operator slotted a script mid-battle", 1);
-      } else if (intent.type === "chat") {
         const text = p.text ?? "";
+        directive = parseDirective(text);
+        targetElement = parseElement(text);
+        synchro = Math.min(100, synchro + 2); // good coaching nudges synchro up
+        lastOperatorTick = tick;
+        // The operator's words appear in the feed — a dialogue needs both sides.
         if (text.trim()) {
           await convex.mutation(api.session.pushEvent, {
             sessionId,
@@ -193,21 +202,46 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
             event: { type: "dialogue", speaker: "OPERATOR", text },
           });
         }
-        const reply = await cfg.mind.speak(
-          {
-            agentName: agent.name,
-            agentExt: agent.ext,
-            bondTier: agent.bondTier,
-            recentMemories: [],
-            situation: "mid-dive chat",
-          },
-          p.text ?? "",
-        );
+        // The ack must not block the tick: the world keeps fighting mid-sentence.
+        sayAsync(`operator command: ${text}`, `operator command: ${text}`);
+        await trace("L1", `command:${directive}`, `operator said "${text}"`, Date.now() - t0);
+      } else if (intent.type === "slot_script") {
+        synchro = Math.min(100, synchro + 4);
+        const flavor = applyScript(world, p.scriptId, targetElement);
         await convex.mutation(api.session.pushEvent, {
           sessionId,
           tick,
-          event: { type: "dialogue", speaker: `${agent.name}.${agent.ext}`, text: reply },
+          event: { type: "script_fired", scriptId: p.scriptId, byId: `agent-${agent._id}` },
         });
+        if (flavor) {
+          await convex.mutation(api.session.pushEvent, {
+            sessionId,
+            tick,
+            event: { type: "dialogue", speaker: `${agent.name}.${agent.ext}`, text: flavor },
+          });
+        }
+        await trace("L1", `slot_script:${p.scriptId}`, flavor ?? "operator slotted a script mid-battle", 1);
+      } else if (intent.type === "chat") {
+        const text = p.text ?? "";
+        // Chat that reads like a command also steers the agent ("hit the acqua").
+        if (
+          /retreat|fall back|disengage|hold|wait|steady|focus|weakest|thin|protect|guard|cover|attack|hit|flank/.test(
+            text.toLowerCase(),
+          )
+        ) {
+          directive = parseDirective(text);
+          targetElement = parseElement(text);
+          synchro = Math.min(100, synchro + 2);
+        }
+        lastOperatorTick = tick;
+        if (text.trim()) {
+          await convex.mutation(api.session.pushEvent, {
+            sessionId,
+            tick,
+            event: { type: "dialogue", speaker: "OPERATOR", text },
+          });
+        }
+        sayAsync("mid-dive chat", text);
         await trace("L2", "chat_reply", `responded to operator`, Date.now() - t0);
       }
     }
@@ -217,7 +251,7 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
     const situation = agentF
       ? `${world.fighters.filter((f) => f.kind === "virus" && f.hp > 0).length} viruses, agent hp ${agentF.hp}%${agentF.hp < 30 ? ", hp low" : ""}`
       : "agent down";
-    tickWorld(world, TICK_MS / 1000, directive, rand);
+    tickWorld(world, TICK_MS / 1000, directive, rand, targetElement);
 
     // Drain world events into the Convex feed.
     for (const e of world.events.splice(0)) {
@@ -280,7 +314,8 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
 
     // 5. L2 heartbeat, slow cadence: the agent comments on the fight.
     // Fire-and-forget: a slow vendor must never stall the 4Hz tick loop.
-    if (tick % 40 === 0 && situation !== "agent down") {
+    // Stays quiet for a bit after the operator speaks — no pile-on.
+    if (tick % 120 === 0 && tick - lastOperatorTick > 60 && situation !== "agent down") {
       cfg.mind
         .speak(
           {

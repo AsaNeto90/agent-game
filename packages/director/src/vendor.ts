@@ -22,7 +22,7 @@ import { MockMind, type MindContext, type MindDecision, type MindProvider } from
 
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai";
 const DEFAULT_MODEL = "gemini-3.8-flash";
-const DEFAULT_TIMEOUT_MS = 12_000;
+const DEFAULT_TIMEOUT_MS = 30_000;
 
 const ACTIONS = ["engage", "disengage", "hold", "focus_weakest", "protect"] as const;
 
@@ -53,16 +53,18 @@ export class VendorMind implements MindProvider {
   private readonly fallback = new MockMind();
 
   constructor(opts: VendorMindOptions) {
-    if (!opts.apiKey) throw new Error("VendorMind needs an apiKey");
+    // apiKey may be "" for keyless local endpoints (Ollama, LM Studio) —
+    // the Authorization header is omitted in that case.
     this.name = opts.name ?? "vendor";
-    this.apiKey = opts.apiKey;
+    this.apiKey = opts.apiKey ?? "";
     // Tolerate a pasted full endpoint: a trailing /chat/completions is stripped,
     // so MIND_BASE_URL=.../v1beta/openai/chat/completions still resolves correctly.
     this.baseUrl = (opts.baseUrl ?? GEMINI_BASE_URL)
       .replace(/\/$/, "")
       .replace(/\/chat\/completions$/, "");
     this.model = opts.model ?? DEFAULT_MODEL;
-    this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.timeoutMs =
+      opts.timeoutMs ?? Number(process.env.MIND_TIMEOUT_MS ?? DEFAULT_TIMEOUT_MS);
     this.fetchFn = opts.fetchFn ?? fetch;
   }
 
@@ -100,7 +102,8 @@ export class VendorMind implements MindProvider {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          authorization: `Bearer ${this.apiKey}`,
+          // Local endpoints (Ollama etc.) need no key — omit the header then.
+          ...(this.apiKey ? { authorization: `Bearer ${this.apiKey}` } : {}),
         },
         body: JSON.stringify({
           model: this.model,
@@ -110,6 +113,10 @@ export class VendorMind implements MindProvider {
           ] satisfies ChatMessage[],
           max_tokens: maxTokens,
           temperature: 0.8,
+          // Kill switch for hybrid-reasoning models (Qwen3 family on Ollama):
+          // MIND_THINK=false skips the chain-of-thought preamble entirely and
+          // answers directly. Unknown field — non-Ollama endpoints ignore it.
+          ...(process.env.MIND_THINK === "false" ? { think: false } : {}),
         }),
         signal: AbortSignal.timeout(this.timeoutMs),
       });
@@ -177,9 +184,11 @@ export function vendorMindFromEnv(): VendorMind | null {
   const provider = process.env.MIND_PROVIDER ?? "mock";
   if (provider !== "gemini" && provider !== "openai-compatible") return null;
   const apiKey = process.env.GEMINI_API_KEY || process.env.MIND_API_KEY || "";
-  if (!apiKey) {
+  // Gemini always needs a key. openai-compatible endpoints may be keyless
+  // (e.g. local Ollama) — the Authorization header is omitted then.
+  if (provider === "gemini" && !apiKey) {
     console.error(
-      `[director] MIND_PROVIDER=${provider} needs GEMINI_API_KEY (or MIND_API_KEY) in .env — grab a free one at https://aistudio.google.com/apikey`,
+      `[director] MIND_PROVIDER=gemini needs GEMINI_API_KEY (or MIND_API_KEY) in .env — grab a free one at https://aistudio.google.com/apikey`,
     );
     process.exit(1);
   }

@@ -7,10 +7,19 @@
  * Compile an agent first via the Convex dashboard or:
  *   npx convex run agents:compile '{"name":"AstroMan","ext":"PY"}'
  */
-import "dotenv/config";
+import dotenv from "dotenv";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { MockMind, type MindProvider } from "./mind.js";
 import { vendorMindFromEnv } from "./vendor.js";
 import { runDirector } from "./loop.js";
+
+// Load packages/director/.env relative to this file, not the shell's CWD:
+// `pnpm --filter` runs from the repo root, where bare dotenv/config would
+// silently miss it and the director would fall back to MockMind.
+dotenv.config({
+  path: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.env"),
+});
 
 const convexUrl = process.env.CONVEX_URL;
 const agentId = process.env.AGENT_ID;

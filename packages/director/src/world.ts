@@ -7,6 +7,7 @@ import {
   ELEMENT_BEATS,
   elementMultiplier,
   rangeBandOf,
+  STARTER_SCRIPTS,
   type Element,
   type Pose,
   type RangeBand,
@@ -26,6 +27,8 @@ export interface Fighter {
   cooldown: number;
   /** viruses only: simple aggression 0..1 */
   aggression?: number;
+  /** barrier hp from ward scripts — absorbs damage before hp */
+  shield?: number;
 }
 
 export interface WorldState {
@@ -66,6 +69,7 @@ export function tickWorld(
   dt: number,
   directive: "engage" | "disengage" | "hold" | "focus_weakest" | "protect",
   rand: () => number,
+  targetElement?: Element | null,
 ): void {
   const agent = state.fighters.find((f) => f.kind === "agent" && f.hp > 0);
   const viruses = state.fighters.filter((f) => f.kind === "virus" && f.hp > 0);
@@ -91,7 +95,12 @@ export function tickWorld(
     const pick =
       directive === "focus_weakest"
         ? viruses.reduce((a, b) => (a.hp <= b.hp ? a : b))
-        : nearest(agent, viruses)!.target;
+        : targetElement && viruses.some((v) => v.element === targetElement)
+          ? nearest(
+              agent,
+              viruses.filter((v) => v.element === targetElement),
+            )!.target
+          : nearest(agent, viruses)!.target;
     const d = dist(agent.pos, pick.pos);
     const band: RangeBand = rangeBandOf(d);
 
@@ -155,7 +164,14 @@ function moveAway(f: Fighter, from: Vec3, dt: number): void {
 }
 
 function strike(state: WorldState, attacker: Fighter, target: Fighter, raw: number): void {
-  const damage = Math.max(1, Math.round(raw));
+  let damage = Math.max(1, Math.round(raw));
+  // Barrier shields absorb first.
+  const shield = target.shield ?? 0;
+  if (shield > 0) {
+    const absorbed = Math.min(shield, damage);
+    target.shield = shield - absorbed;
+    damage -= absorbed;
+  }
   target.hp = Math.max(0, target.hp - damage);
   target.pose = target.hp <= 0 ? "down" : "hit";
   state.events.push({
@@ -166,6 +182,63 @@ function strike(state: WorldState, attacker: Fighter, target: Fighter, raw: numb
     element: attacker.element,
   });
   if (target.hp <= 0) state.events.push({ type: "down", fighterId: target.id });
+}
+
+/**
+ * Apply an operator-slotted script to the world. Damage/heal/barrier/stun are
+ * real; buff/summon/terrain/phase are flavor-only in v1 (no L0 mechanics yet).
+ * Returns a one-line description for the feed, or null if nothing happened.
+ */
+export function applyScript(
+  state: WorldState,
+  scriptId: string,
+  targetElement?: Element | null,
+): string | null {
+  const def = STARTER_SCRIPTS.find((s) => s.id === scriptId);
+  if (!def) return null;
+  const agent = state.fighters.find((f) => f.kind === "agent" && f.hp > 0);
+  const viruses = state.fighters.filter((f) => f.kind === "virus" && f.hp > 0);
+  const pickTarget = (): Fighter | null => {
+    if (viruses.length === 0) return null;
+    const pool =
+      targetElement && viruses.some((v) => v.element === targetElement)
+        ? viruses.filter((v) => v.element === targetElement)
+        : viruses;
+    return pool.reduce((a, b) => (a.hp <= b.hp ? a : b));
+  };
+
+  switch (def.effect.kind) {
+    case "damage": {
+      const target = pickTarget();
+      if (!target || !agent) return null;
+      strike(
+        state,
+        agent,
+        target,
+        def.effect.power * elementMultiplier(def.element, target.element),
+      );
+      return `${def.name} slams ${target.name}.`;
+    }
+    case "heal": {
+      if (!agent) return null;
+      agent.hp = Math.min(agent.maxHp, agent.hp + def.effect.power);
+      return `${def.name} knits ${agent.name} back together.`;
+    }
+    case "barrier": {
+      if (!agent) return null;
+      agent.shield = (agent.shield ?? 0) + def.effect.power;
+      return `${def.name} up — hard-light barrier holding.`;
+    }
+    case "stun": {
+      const target = pickTarget();
+      if (!target) return null;
+      target.cooldown = Math.max(target.cooldown, 3);
+      return `${def.name} locks ${target.name} down.`;
+    }
+    default:
+      // buff / summon / terrain / phase: no L0 mechanics in v1 yet.
+      return null;
+  }
 }
 
 export { ELEMENT_BEATS };
