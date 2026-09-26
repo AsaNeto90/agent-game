@@ -2,8 +2,8 @@ import { ConvexProvider, ConvexReactClient, useMutation, useQuery } from "convex
 import { StrictMode, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import * as THREE from "three";
-import { api } from "../../convex/_generated/api.js";
-import type { Id } from "../../convex/_generated/dataModel.js";
+import { api } from "../../../convex/_generated/api.js";
+import type { Id } from "../../../convex/_generated/dataModel.js";
 
 const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL as string);
 
