@@ -8,11 +8,12 @@ import {
   MIND_MANEUVER_TICKS,
   nudgeForStep,
   parseMoveSequence,
+  regenStructures,
   tacticalSituation,
   visibleFighters,
   type MovePrimitive,
 } from "./loop.js";
-import type { Fighter } from "./world.js";
+import { spawnStructures, type Fighter, type WorldState } from "./world.js";
 
 describe("isReadyCommand", () => {
   it("matches the ways an operator asks for the next wave", () => {
@@ -210,12 +211,12 @@ describe("tacticalSituation", () => {
       style: "balanced" as const,
     };
     const s = tacticalSituation(world, 2);
-    expect(s).toBe("w2 | 2v: aqua40(scrapbit) melee SWING!, fire25(scrapbit) mid WINDUP | agent 80% melee | style balanced");
+    expect(s).toBe("w2 | 2v: aqua40(scrapbit) melee SWING!, fire25(scrapbit) mid WINDUP | agent 80% melee | site: none | style balanced");
   });
 
   it("handles a cleared arena", () => {
     const world = { fighters: [mkAgent(120, 0, 0)], events: [], style: "evasive" as const };
-    expect(tacticalSituation(world, 3)).toBe("w3 | 0v:  | agent 100% far | style evasive");
+    expect(tacticalSituation(world, 3)).toBe("w3 | 0v:  | agent 100% far | site: none | style evasive");
   });
 });
 
@@ -518,5 +519,71 @@ describe("agent's own script casting", () => {
     const line = applyMindScript(world, "aegis-wall", null, 0, new Map());
     expect(line).toMatch(/Aegis Wall/);
     expect(world.fighters[0].shield).toBeGreaterThan(0);
+  });
+});
+
+describe("site defense loop", () => {
+  const mkAgent = (): Fighter => ({
+    id: "agent-1",
+    kind: "agent",
+    name: "agent",
+    pos: { x: 0, y: 0, z: 0 },
+    pose: "idle",
+    hp: 120,
+    maxHp: 120,
+    element: "null",
+    cooldown: 0,
+  });
+
+  it("tacticalSituation shows node health and virus objectives", () => {
+    const world: WorldState = { fighters: [mkAgent()], events: [], style: "balanced" };
+    spawnStructures(world);
+    const db = world.structures!.find((s) => s.id === "site-database")!;
+    db.hp = 60;
+    world.fighters.push({
+      id: "v1",
+      kind: "virus",
+      name: "Spitter",
+      species: "spitter",
+      pos: { x: 6, y: 0, z: 0 },
+      pose: "idle",
+      hp: 36,
+      maxHp: 36,
+      element: "aqua",
+      cooldown: 0,
+      targetId: "site-database",
+    });
+    const s = tacticalSituation(world, 2);
+    expect(s).toContain("aqua36(spitter)→Database mid");
+    expect(s).toContain("site: Homepage 100%, Database 50%, Gateway 100%");
+  });
+
+  it("regenStructures knits living nodes and leaves the fallen", () => {
+    const world: WorldState = { fighters: [mkAgent()], events: [] };
+    spawnStructures(world);
+    world.structures![0].hp = 60;
+    world.structures![1].hp = 0;
+    regenStructures(world);
+    expect(world.structures![0].hp).toBe(96); // 60 + 30% of 120
+    expect(world.structures![1].hp).toBe(0); // the fallen stay down
+    expect(world.structures![2].hp).toBe(120); // capped at max
+  });
+
+  it("buildWaveDebrief remembers what the wave cost the site", () => {
+    const d = buildWaveDebrief({
+      wave: 2,
+      ticksTaken: 100,
+      hpStart: 120,
+      hpEnd: 100,
+      maxHp: 120,
+      minHp: 100,
+      virusesKilled: 3,
+      operatorCommands: 0,
+      mindActions: ["protect"],
+      style: "balanced",
+      siteStatus: "Homepage 80%, Database 100%, Gateway DOWN",
+    });
+    expect(d.memory).toContain("Site: Homepage 80%, Database 100%, Gateway DOWN.");
+    expect(d.memory).toContain("stood guard over the site");
   });
 });

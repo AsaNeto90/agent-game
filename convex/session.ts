@@ -114,7 +114,7 @@ export const writeTick = mutation({
     entities: v.array(
       v.object({
         entityId: v.string(),
-        kind: v.union(v.literal("agent"), v.literal("virus")),
+        kind: v.union(v.literal("agent"), v.literal("virus"), v.literal("structure")),
         name: v.string(),
         x: v.number(),
         y: v.number(),

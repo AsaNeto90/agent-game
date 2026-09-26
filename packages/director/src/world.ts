@@ -40,6 +40,29 @@ export interface Fighter {
   windup?: number;
   /** seconds left airborne — a jumping fighter leaps clean over melee swings */
   airborne?: number;
+  /**
+   * Virus objective: the agent's id or a structure id. Viruses are here for
+   * the site — they only come for the agent when it's close and looks
+   * beatable, or run from it when hurt. Reassessed every ~2s.
+   */
+  targetId?: string;
+  /** seconds until the next objective reassessment */
+  retargetIn?: number;
+  /** running from the agent (hurt) — moves away from it, toward the site */
+  fleeing?: boolean;
+}
+
+/**
+ * A load-bearing node of the website the dive takes place in — the physical
+ * site the agent defends. Viruses chew these; lose all three and the dive
+ * fails. They slowly recompile (+30% maxHp) between waves.
+ */
+export interface Structure {
+  id: string;
+  name: string;
+  pos: Vec3;
+  hp: number;
+  maxHp: number;
 }
 
 export interface WorldState {
@@ -47,6 +70,9 @@ export interface WorldState {
   events: WorldEvent[];
   /** Operator-set fight style — persists across waves until changed. */
   style?: FightStyle;
+  /** The site's nodes. Optional so older snapshots/tests still parse —
+   *  the loop spawns them at dive boot and tickWorld normalizes. */
+  structures?: Structure[];
 }
 
 export type WorldEvent =
@@ -129,6 +155,8 @@ export function tickWorld(
   nudge?: OperatorNudge | null,
   synchro = 50,
 ): void {
+  // Older snapshots and unit tests may not carry structures — normalize.
+  state.structures ??= [];
   const agent = state.fighters.find((f) => f.kind === "agent" && f.hp > 0);
   const viruses = state.fighters.filter((f) => f.kind === "virus" && f.hp > 0);
   if (!agent) return;
@@ -154,16 +182,23 @@ export function tickWorld(
 
   // --- Agent L0 reflex ---
   // Target selection only matters while something is alive to fight.
+  // "protect" is the bodyguard directive: intercept whichever virus is
+  // chewing on the site — the one nearest the agent, so the response is fast.
+  const siteEaters = viruses.filter((v) =>
+    structuresOf(state).some((s) => s.id === v.targetId && s.hp > 0),
+  );
   const pick =
     viruses.length > 0
       ? directive === "focus_weakest"
         ? viruses.reduce((a, b) => (a.hp <= b.hp ? a : b))
-        : targetElement && viruses.some((v) => v.element === targetElement)
-          ? nearest(
-              agent,
-              viruses.filter((v) => v.element === targetElement),
-            )!.target
-          : nearest(agent, viruses)!.target
+        : directive === "protect"
+          ? nearest(agent, siteEaters.length > 0 ? siteEaters : viruses)!.target
+          : targetElement && viruses.some((v) => v.element === targetElement)
+            ? nearest(
+                agent,
+                viruses.filter((v) => v.element === targetElement),
+              )!.target
+            : nearest(agent, viruses)!.target
       : null;
 
   const mv = nudge?.move;
@@ -296,31 +331,52 @@ export function tickWorld(
     agent.pos.y = 0;
   }
 
-  // --- Virus L0: species-driven. Melee species close in, telegraph, and
-  // swipe; spitters hold mid range and spit — jumping won't save you from
-  // spit, lateral movement will. Each species reads its behavior kit. ---
+  // --- Virus L0: species-driven, objective-aware. Viruses are here for the
+  // site, not the agent: each one works its objective (a node, or the agent
+  // when it's close and looks beatable), and runs from the agent when hurt.
+  // Spitters hold mid range and spit — jumping won't save a node from spit,
+  // intercepting the spitter will. ---
   for (const v of viruses) {
     const sp = speciesOf(v);
-    const d = dist(v.pos, agent.pos);
+    // Reassess the objective every ~2s, staggered so the pack doesn't
+    // decide in lockstep.
+    v.retargetIn = (v.retargetIn ?? rand() * 2) - dt;
+    if (v.retargetIn <= 0) {
+      reassessVirusTarget(state, v, agent);
+      v.retargetIn = 2;
+    }
+    const struct = structuresOf(state).find((s) => s.id === v.targetId);
+    const node = struct && struct.hp > 0 ? struct : undefined;
+    const tgtPos = node ? node.pos : agent.pos;
+    const d = dist(v.pos, tgtPos);
+    const dAgent = dist(v.pos, agent.pos);
+    const fleeing = !!v.fleeing && dAgent < AGGRO_RADIUS;
     if (v.windup != null && v.windup > 0) {
       // Committed to the attack: it lands when the wind-up ends, but only
       // if the target is still in reach. Melee whiffs if kited out or
-      // jumped; spit only whiffs if the agent leaves mid range entirely.
+      // jumped; spit only whiffs if the target leaves mid range entirely —
+      // and nodes can't move at all.
       v.windup -= dt;
       v.pose = "windup";
       if (v.windup <= 0) {
         v.windup = 0;
-        const band = rangeBandOf(dist(v.pos, agent.pos));
+        const band = rangeBandOf(dist(v.pos, tgtPos));
         const inReach = sp.ranged ? band === "melee" || band === "mid" : band === "melee";
-        if (agent.hp > 0 && inReach) {
-          strike(
-            state,
-            v,
-            agent,
-            VIRUS_POWER * sp.powerMul * elementMultiplier(v.element, agent.element),
-          );
+        if (inReach) {
+          if (node) {
+            damageStructure(state, v, node, VIRUS_POWER * sp.powerMul);
+          } else if (agent.hp > 0) {
+            strike(
+              state,
+              v,
+              agent,
+              VIRUS_POWER * sp.powerMul * elementMultiplier(v.element, agent.element),
+            );
+          } else {
+            v.pose = "idle";
+          }
         } else {
-          v.pose = "idle"; // whiffed — the operator read it
+          v.pose = "idle"; // whiffed — the target read it
         }
         v.cooldown = VIRUS_COOLDOWN;
       }
@@ -328,7 +384,7 @@ export function tickWorld(
       // Spitter: keeps its distance, backs off if crowded, spits on cooldown.
       const band = rangeBandOf(d);
       if (band === "melee") {
-        moveAway(v, agent.pos, dt * sp.speedMul);
+        moveAway(v, fleeing ? agent.pos : tgtPos, dt * sp.speedMul);
         v.pose = "run";
       } else if (band === "mid") {
         if (v.cooldown <= 0 && rand() < (v.aggression ?? 0.6)) {
@@ -337,8 +393,11 @@ export function tickWorld(
         } else {
           v.pose = "idle";
         }
+      } else if (fleeing) {
+        moveAway(v, agent.pos, dt * sp.speedMul);
+        v.pose = "run";
       } else {
-        moveToward(v, agent.pos, dt * 0.8 * sp.speedMul);
+        moveToward(v, tgtPos, dt * 0.8 * sp.speedMul);
         v.pose = "run";
       }
     } else if (rangeBandOf(d) === "melee") {
@@ -348,8 +407,11 @@ export function tickWorld(
       } else {
         v.pose = "melee_attack";
       }
+    } else if (fleeing) {
+      moveAway(v, agent.pos, dt * sp.speedMul);
+      v.pose = "run";
     } else {
-      moveToward(v, agent.pos, dt * 0.8 * sp.speedMul);
+      moveToward(v, tgtPos, dt * 0.8 * sp.speedMul);
       v.pose = "run";
     }
   }
@@ -392,6 +454,12 @@ function strike(state: WorldState, attacker: Fighter, target: Fighter, raw: numb
     element: attacker.element,
   });
   if (target.hp <= 0) state.events.push({ type: "down", fighterId: target.id });
+  // You hit it — now it's personal. A virus chewing on the site turns on
+  // the agent that struck it instead of running.
+  if (target.kind === "virus" && attacker.kind === "agent" && target.hp > 0) {
+    target.targetId = attacker.id;
+    target.fleeing = false;
+  }
 }
 
 /**
@@ -482,6 +550,9 @@ interface VirusSpecies {
   windupMul: number;
   /** spitters hold mid range and spit; everyone else closes to melee */
   ranged: boolean;
+  /** hp fraction above which the virus engages a close agent instead of
+   *  running — dashers spook easy, bulwarks never back down */
+  bravery: number;
 }
 
 const VIRUS_SPECIES: Record<string, VirusSpecies> = {
@@ -493,6 +564,7 @@ const VIRUS_SPECIES: Record<string, VirusSpecies> = {
     powerMul: 1,
     windupMul: 1,
     ranged: false,
+    bravery: 0.35,
   },
   dasher: {
     name: "Dasher",
@@ -502,6 +574,7 @@ const VIRUS_SPECIES: Record<string, VirusSpecies> = {
     powerMul: 0.85,
     windupMul: 0.6,
     ranged: false,
+    bravery: 0.15,
   },
   spitter: {
     name: "Spitter",
@@ -511,6 +584,7 @@ const VIRUS_SPECIES: Record<string, VirusSpecies> = {
     powerMul: 0.9,
     windupMul: 0.9,
     ranged: true,
+    bravery: 0.5,
   },
   bulwark: {
     name: "Bulwark",
@@ -520,11 +594,91 @@ const VIRUS_SPECIES: Record<string, VirusSpecies> = {
     powerMul: 1.7,
     windupMul: 1.4,
     ranged: false,
+    bravery: 0.8,
   },
 };
 
 const speciesOf = (f: Fighter): VirusSpecies =>
   VIRUS_SPECIES[f.species ?? "scrapbit"] ?? VIRUS_SPECIES.scrapbit;
+
+/** The website made physical: three load-bearing nodes in a triangle. */
+const SITE_NODES = [
+  { id: "site-homepage", name: "Homepage", x: 11, z: 0 },
+  { id: "site-database", name: "Database", x: -5.5, z: 9.5 },
+  { id: "site-gateway", name: "Gateway", x: -5.5, z: -9.5 },
+] as const;
+
+export const STRUCTURE_MAX_HP = 120;
+/** Between waves the site recompiles: living nodes regain this fraction. */
+export const STRUCTURE_REGEN = 0.3;
+
+/** Build the site's nodes — once per dive, at boot. */
+export function spawnStructures(state: WorldState): void {
+  state.structures = SITE_NODES.map((n) => ({
+    id: n.id,
+    name: n.name,
+    pos: { x: n.x, y: 0, z: n.z },
+    hp: STRUCTURE_MAX_HP,
+    maxHp: STRUCTURE_MAX_HP,
+  }));
+}
+
+const structuresOf = (state: WorldState): Structure[] => state.structures ?? [];
+
+/** How close the agent has to be before a virus decides about it. */
+const AGGRO_RADIUS = 7;
+
+export function nearestStructure(state: WorldState, from: Vec3): Structure | null {
+  let best: Structure | null = null;
+  let bestD = Infinity;
+  for (const s of structuresOf(state)) {
+    if (s.hp <= 0) continue;
+    const d = dist(from, s.pos);
+    if (d < bestD) {
+      bestD = d;
+      best = s;
+    }
+  }
+  return best;
+}
+
+/**
+ * Viruses want the site, not the agent. Every couple of seconds each virus
+ * picks its objective: engage the agent (close and beatable), run from it
+ * (close and hurt — it flees toward the site, not away from the fight), or
+ * go back to chewing the nearest node.
+ */
+function reassessVirusTarget(state: WorldState, v: Fighter, agent: Fighter): void {
+  const sp = speciesOf(v);
+  const dAgent = dist(v.pos, agent.pos);
+  if (dAgent < AGGRO_RADIUS) {
+    if (v.hp / v.maxHp > (sp.bravery ?? 0.35)) {
+      v.targetId = agent.id;
+      v.fleeing = false;
+    } else {
+      v.targetId = nearestStructure(state, v.pos)?.id ?? agent.id;
+      v.fleeing = true;
+    }
+  } else {
+    v.targetId = nearestStructure(state, v.pos)?.id ?? agent.id;
+    v.fleeing = false;
+  }
+}
+
+/** A virus strike landing on a site node — flat damage, no jumping away. */
+function damageStructure(state: WorldState, attacker: Fighter, s: Structure, raw: number): void {
+  if (s.hp <= 0) return;
+  const damage = Math.max(1, Math.round(raw));
+  s.hp = Math.max(0, s.hp - damage);
+  state.events.push({
+    type: "hit",
+    attackerId: attacker.id,
+    targetId: s.id,
+    damage,
+    element: attacker.element,
+  });
+  if (s.hp <= 0) state.events.push({ type: "down", fighterId: s.id });
+}
 
 export function spawnWave(state: WorldState, wave: number, rand: () => number): void {
   state.fighters = state.fighters.filter((f) => f.kind === "agent" || f.hp > 0);
@@ -537,18 +691,23 @@ export function spawnWave(state: WorldState, wave: number, rand: () => number): 
     const angle = rand() * Math.PI * 2;
     const d = 7 + rand() * 4;
     const hp = Math.round(baseHp * sp.hpMul);
+    const px = ax + Math.cos(angle) * d;
+    const pz = az + Math.sin(angle) * d;
     state.fighters.push({
       id: `virus-w${wave}-${i}`,
       kind: "virus",
       species: key,
       name: sp.name,
-      pos: { x: ax + Math.cos(angle) * d, y: 0, z: az + Math.sin(angle) * d },
+      pos: { x: px, y: 0, z: pz },
       pose: "idle",
       hp,
       maxHp: hp,
       element: sp.element,
       cooldown: 0,
       aggression: Math.min(0.6 + wave * 0.1, 0.95),
+      // Fresh viruses come for the site — the agent has to earn their attention.
+      targetId: nearestStructure(state, { x: px, y: 0, z: pz })?.id,
+      retargetIn: rand() * 2,
     });
   });
 }

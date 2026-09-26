@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { elementMultiplier, rangeBandOf } from "@agent-game/shared";
-import { applyScript, rng, spawnWave, synchroTier, tickWorld, waveComposition, type Fighter, type WorldState } from "./world.js";
+import { applyScript, rng, spawnStructures, spawnWave, synchroTier, tickWorld, waveComposition, STRUCTURE_MAX_HP, type Fighter, type WorldState } from "./world.js";
 
 describe("element matchups", () => {
   it("fire beats wood, wood resists fire", () => {
@@ -721,3 +721,135 @@ describe("virus species", () => {
   });
 });
 
+describe("site defense — viruses want the website, not the agent", () => {
+  const mkAgentW = (): WorldState => ({
+    fighters: [
+      {
+        id: "a",
+        kind: "agent",
+        name: "Test.PY",
+        pos: { x: 0, y: 0, z: 0 },
+        pose: "idle",
+        hp: 100,
+        maxHp: 100,
+        element: "null",
+        cooldown: 0,
+      },
+    ],
+    events: [],
+  });
+  const mkVirus = (id: string, x: number, z: number, hp = 40): Fighter => ({
+    id,
+    kind: "virus",
+    name: "Scrapbit",
+    pos: { x, y: 0, z },
+    pose: "idle",
+    hp,
+    maxHp: 40,
+    element: "aqua",
+    cooldown: 0,
+    aggression: 1,
+  });
+  const mkWorld = (): WorldState => {
+    const w = mkAgentW();
+    spawnStructures(w);
+    return w;
+  };
+
+  it("spawnStructures builds three 120hp nodes in a triangle", () => {
+    const w = mkAgentW();
+    spawnStructures(w);
+    expect(w.structures).toHaveLength(3);
+    expect(w.structures!.map((s) => s.name)).toEqual(["Homepage", "Database", "Gateway"]);
+    for (const s of w.structures!) {
+      expect(s.hp).toBe(STRUCTURE_MAX_HP);
+      expect(s.maxHp).toBe(STRUCTURE_MAX_HP);
+    }
+  });
+
+  it("a virus far from the agent goes for the nearest node", () => {
+    const w = mkWorld();
+    const v = mkVirus("v", 30, 0);
+    v.retargetIn = 0;
+    w.fighters.push(v);
+    tickWorld(w, 0.25, "engage", rng(1));
+    expect(v.targetId).toBe("site-homepage");
+    expect(v.pos.x).toBeLessThan(30); // moving toward it
+  });
+
+  it("a healthy virus close to the agent engages it", () => {
+    const w = mkWorld();
+    const v = mkVirus("v", 3, 0);
+    v.retargetIn = 0;
+    w.fighters.push(v);
+    tickWorld(w, 0.25, "engage", rng(1));
+    expect(v.targetId).toBe("a");
+    expect(v.fleeing).toBe(false);
+  });
+
+  it("a hurt virus runs from the agent toward the site", () => {
+    const w = mkWorld();
+    const v = mkVirus("v", 3, 0, 12); // 30% hp — below scrapbit bravery 0.35
+    v.retargetIn = 0;
+    w.fighters.push(v);
+    tickWorld(w, 0.25, "engage", rng(1));
+    expect(v.fleeing).toBe(true);
+    expect(v.targetId).toBe("site-homepage");
+    expect(v.pos.x).toBeGreaterThan(3); // running from the agent
+  });
+
+  it("a virus wind-up landing on a node damages the structure", () => {
+    const w = mkWorld();
+    const node = w.structures!.find((s) => s.id === "site-homepage")!;
+    const v = mkVirus("v", 12, 0); // 1 unit from the node — melee
+    v.targetId = "site-homepage";
+    v.retargetIn = 100;
+    v.windup = 0.1;
+    w.fighters.push(v);
+    tickWorld(w, 0.25, "engage", rng(1));
+    expect(node.hp).toBeLessThan(120);
+    expect(w.events.some((e) => e.type === "hit" && e.targetId === "site-homepage")).toBe(true);
+  });
+
+  it("striking a site-eater pulls its aggro onto the agent", () => {
+    const w = mkWorld();
+    const v = mkVirus("v", 12, 0);
+    v.targetId = "site-homepage";
+    v.retargetIn = 100;
+    w.fighters.push(v);
+    const agent = w.fighters[0];
+    agent.pos = { x: 12.5, y: 0, z: 0 }; // teleport into melee and swing
+    agent.cooldown = 0;
+    tickWorld(w, 0.25, "engage", rng(7));
+    expect(v.hp).toBeLessThan(40); // the swing connected
+    expect(v.targetId).toBe("a");
+    expect(v.fleeing).toBe(false);
+  });
+
+  it("spawnWave sends fresh viruses at the site", () => {
+    const w = mkAgentW();
+    spawnStructures(w);
+    spawnWave(w, 1, rng(9));
+    const viruses = w.fighters.filter((f) => f.kind === "virus");
+    expect(viruses.length).toBeGreaterThan(0);
+    for (const v of viruses) expect(v.targetId).toMatch(/^site-/);
+  });
+
+  it("protect directive intercepts the site-eater, not the nearest virus", () => {
+    const w = mkWorld();
+    const eater = mkVirus("eater", 9, 0);
+    eater.targetId = "site-homepage";
+    eater.retargetIn = 100;
+    eater.cooldown = 999;
+    eater.aggression = 0;
+    const lurker = mkVirus("lurker", -3, 0);
+    lurker.targetId = "a";
+    lurker.retargetIn = 100;
+    lurker.cooldown = 999;
+    lurker.aggression = 0;
+    w.fighters.push(eater, lurker);
+    const agent = w.fighters[0];
+    tickWorld(w, 0.25, "protect", rng(3));
+    expect(agent.pos.x).toBeGreaterThan(0); // moved toward the eater at +x
+  });
+});

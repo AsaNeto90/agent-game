@@ -73,14 +73,15 @@ export function pickScript(ctx: MindContext): { scriptId: string } | undefined {
   const t = ctx.tactics ?? ctx.situation;
   const hp = /agent (\d+)%/.exec(t);
   const agentHp = hp ? parseInt(hp[1], 10) : 100;
-  // Per-virus readout: "aqua40(spitter) mid WINDUP" — species in parens,
-  // optional so legacy readouts ("aqua40 mid") still parse as scrapbits.
+  // Per-virus readout: "aqua40(spitter)→Database mid WINDUP" — species in
+  // parens, then an optional objective arrow (→Agent or →NodeName), so
+  // legacy readouts ("aqua40 mid") still parse as scrapbits.
   const viruses = [
-    ...t.matchAll(/(\w+?)(\d+)(?:\((\w+)\))? (melee|mid|long|far)( WINDUP| SWING!)?/g),
+    ...t.matchAll(/(\w+?)(\d+)(?:\((\w+)\))?(?:→(\w+))? (melee|mid|long|far)( WINDUP| SWING!)?/g),
   ];
   const hps = viruses.map((m) => parseInt(m[2], 10));
   const weakest = hps.length ? Math.min(...hps) : Infinity;
-  const bulwarkWinding = viruses.some((m) => (m[3] ?? "scrapbit") === "bulwark" && !!(m[5] ?? "").trim());
+  const bulwarkWinding = viruses.some((m) => (m[3] ?? "scrapbit") === "bulwark" && !!(m[6] ?? "").trim());
   const requested = !!ctx.scriptRequested;
 
   if ((agentHp < 40 || (requested && agentHp < 70)) && can("mend-protocol"))
@@ -125,8 +126,8 @@ export class MockMind implements MindProvider {
     const withScript = (d: MindDecision): MindDecision =>
       script ? { ...d, script } : d;
     // Reads the tactical snapshot like a vendor would: survival first,
-    // then imminent swings, then repositioning, then pack tactics.
-    // Tactics format: "w2 | 3v: aqua40 melee SWING!, null25 mid WINDUP | agent 70% melee | style balanced"
+    // then imminent swings, then the site's defense, then pack tactics.
+    // Tactics format: "w2 | 3v: aqua40(spitter)→Database mid WINDUP, null25 melee SWING! | agent 70% melee | site: Homepage 80%, Database 100%, Gateway 45% | style balanced"
     const t = ctx.tactics ?? ctx.situation;
     const hp = /agent (\d+)%/.exec(t);
     const agentHp = hp ? parseInt(hp[1], 10) : 100;
@@ -156,6 +157,15 @@ export class MockMind implements MindProvider {
     // Multiple telegraphs -> reposition before they converge.
     if (windups >= 2) {
       return withScript({ action: "dodge", rationale: "too many swings — repositioning" });
+    }
+    // Something's chewing the site -> go bodyguard. Survival is already
+    // handled above; defending the nodes IS the mission.
+    const siteEaters = (t.match(/→(?!Agent\b)\w+/g) ?? []).length;
+    if (siteEaters > 0 && agentHp >= 35) {
+      return withScript({
+        action: "protect",
+        rationale: `intercepting ${siteEaters} site-eater${siteEaters === 1 ? "" : "s"}`,
+      });
     }
     // Recovered -> drop the evasive stance you adopted yourself.
     if (style === "evasive" && agentHp > 60) {

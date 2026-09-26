@@ -218,3 +218,74 @@ describe("pickScript — the agent's own script brain", () => {
     expect(d.script).toBeUndefined();
   });
 });
+
+describe("MockMind.decide bodyguard duty", () => {
+  const mind = new MockMind();
+  const tctx = (tactics: string): MindContext => ({
+    agentName: "AstroMan",
+    agentExt: "PY",
+    bondTier: "spark",
+    recentMemories: [],
+    situation: "fighting",
+    tactics,
+  });
+
+  it("intercepts site-eaters with protect", async () => {
+    const d = await mind.decide(
+      tctx(
+        "w2 | 2v: aqua40(scrapbit)→Database mid, elec32(dasher)→Agent far | agent 80% far | site: Homepage 100%, Database 80%, Gateway 100% | style balanced",
+      ),
+    );
+    expect(d.action).toBe("protect");
+    expect(d.rationale).toMatch(/site-eater/);
+  });
+
+  it("survival still beats bodyguard duty when hurt", async () => {
+    const d = await mind.decide(
+      tctx(
+        "w2 | 1v: aqua40(scrapbit)→Database mid | agent 20% mid | site: Homepage 100%, Database 80%, Gateway 100% | style balanced",
+      ),
+    );
+    expect(d.action).toBe("disengage");
+  });
+
+  it("stands down when nothing is chewing the site", async () => {
+    const d = await mind.decide(
+      tctx(
+        "w2 | 2v: aqua40(scrapbit)→Agent melee, elec32(dasher)→Agent far | agent 80% melee | site: Homepage 100%, Database 100%, Gateway 100% | style balanced",
+      ),
+    );
+    expect(d.action).toBe("engage");
+  });
+});
+
+describe("pickScript reads objective arrows", () => {
+  const KIT = [...AGENT_KIT];
+  const sctx = (tactics: string, scriptsReady: string[] = KIT): MindContext => ({
+    agentName: "AstroMan",
+    agentExt: "PY",
+    bondTier: "spark",
+    recentMemories: [],
+    situation: "fighting",
+    tactics,
+    scriptsReady,
+  });
+
+  it("still reads the radar when viruses carry objective arrows", () => {
+    const s = pickScript(
+      sctx(
+        "w2 | 2v: aqua15(scrapbit)→Database melee, null40(scrapbit)→Agent far | agent 90% melee | site: Homepage 100%, Database 100%, Gateway 100% | style balanced",
+      ),
+    );
+    expect(s?.scriptId).toBe("arc-lance");
+  });
+
+  it("still spots a winding bulwark through the arrow", () => {
+    const s = pickScript(
+      sctx(
+        "w4 | 1v: wood176(bulwark)→Homepage melee WINDUP | agent 80% melee | site: Homepage 100%, Database 100%, Gateway 100% | style balanced",
+      ),
+    );
+    expect(s?.scriptId).toBe("aegis-wall");
+  });
+});

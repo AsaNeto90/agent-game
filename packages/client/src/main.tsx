@@ -126,22 +126,27 @@ function DiveView({ sessionId, followCam }: { sessionId: Id<"sessions">; followC
       seen.add(e.id);
       let mesh = meshes.current.get(e.id);
       if (!mesh) {
+        const isStructure = e.kind === "structure";
         const geo =
           e.kind === "agent"
             ? new THREE.CapsuleGeometry(0.5, 1.1, 6, 14)
-            : new THREE.OctahedronGeometry(0.7);
+            : isStructure
+              ? new THREE.CylinderGeometry(0.9, 1.15, 3.2, 8)
+              : new THREE.OctahedronGeometry(0.7);
         mesh = new THREE.Mesh(
           geo,
           new THREE.MeshStandardMaterial({
-            color:
-              e.kind === "virus"
+            color: isStructure
+              ? 0x22d3ee
+              : e.kind === "virus"
                 ? (SPECIES_COLORS[e.name] ?? ELEMENT_COLORS[e.element] ?? 0x8899aa)
                 : (ELEMENT_COLORS[e.element] ?? 0x8899aa),
             roughness: 0.35,
             metalness: 0.6,
           }),
         );
-        mesh.position.set(e.position.x, 1 + e.position.y, e.position.z);
+        // Site nodes are 3.2-tall pillars standing on the ground.
+        mesh.position.set(e.position.x, (isStructure ? 1.6 : 1) + e.position.y, e.position.z);
         // Floating HP bar — a sprite that always faces the camera. Redrawn
         // only when the hp fraction actually changes, so it costs nothing
         // at rest.
@@ -151,14 +156,18 @@ function DiveView({ sessionId, followCam }: { sessionId: Id<"sessions">; followC
         const barTex = new THREE.CanvasTexture(barCanvas);
         const barMat = new THREE.SpriteMaterial({ map: barTex, depthTest: false });
         const bar = new THREE.Sprite(barMat);
-        bar.scale.set(1.7, 0.21, 1);
-        bar.position.y = 1.7;
+        bar.scale.set(isStructure ? 2.4 : 1.7, 0.21, 1);
+        bar.position.y = isStructure ? 2.3 : 1.7;
         mesh.add(bar);
         mesh.userData.bar = { canvas: barCanvas, tex: barTex, mat: barMat, last: -1 };
         scene.add(mesh);
         meshes.current.set(e.id, mesh);
       }
-      mesh.userData.target = new THREE.Vector3(e.position.x, 1 + e.position.y, e.position.z);
+      mesh.userData.target = new THREE.Vector3(
+        e.position.x,
+        (e.kind === "structure" ? 1.6 : 1) + e.position.y,
+        e.position.z,
+      );
       mesh.userData.pose = e.pose;
       mesh.userData.kind = e.kind;
       const s = e.hp / e.maxHp;
@@ -219,7 +228,13 @@ function Hud({
   const events = (snapshot?.events ?? []) as BrainEvent[];
 
   const prettyId = (id: string) =>
-    id.startsWith("agent-") ? "Agent" : id.startsWith("virus-") ? `Virus ${id.slice(6)}` : id;
+    id.startsWith("agent-")
+      ? "Agent"
+      : id.startsWith("virus-")
+        ? `Virus ${id.slice(6)}`
+        : id.startsWith("site-")
+          ? id.slice(5).charAt(0).toUpperCase() + id.slice(6)
+          : id;
 
   const renderEvent = (e: BrainEvent, i: number) => {
     switch (e.type) {

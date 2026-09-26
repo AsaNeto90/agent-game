@@ -104,7 +104,7 @@ export class VendorMind implements MindProvider {
       `- disengage: fall back and create distance (use when hurt or outnumbered)`,
       `- hold: stay put, wait for the operator's call`,
       `- focus_weakest: target the weakest virus to thin the pack`,
-      `- protect: body-block between the viruses and whatever the operator cares about`,
+      `- protect: intercept the virus nearest you that is chewing on the site — defending the nodes IS the mission`,
       `- dodge: quick dash away from the nearest virus to reposition`,
       `- jump: leap — dodges a melee swing about to land (marked SWING! in the situation)`,
       `- orbit: circle around the nearest virus for a few seconds, holding distance (use when the operator asks to pivot/circle them, or to reposition without retreating)`,
@@ -112,8 +112,9 @@ export class VendorMind implements MindProvider {
       `- style: your persistent stance. "evasive" makes you favor dodging and jumping on your own; "balanced" fights straightforward; null leaves it unchanged. Go evasive yourself when hurt — don't wait to be told.`,
       `- script: OPTIONAL — fire one of your own kit scripts alongside the action. Your kit: mend-protocol (heal 25 — use when your hp is under 40%), aegis-wall (barrier 30 — use when a bulwark is winding up), static-snare (stun — use when 3+ viruses), arc-lance (mid-range damage — finish a virus under 20hp), cinder-slash (heavy melee damage — use when the operator says "use something"). Only include it when the moment is right; most ticks, omit it. Never invent other ids.`,
       `The operator's recent words are given with the situation — honor casual requests ("be careful", "go aggressive") even when they don't match a command word.`,
-      `Situation format: "w2 | 3v: aqua40(spitter) melee SWING!, null25(scrapbit) mid WINDUP | agent 70% melee | style balanced".`,
+      `Situation format: "w2 | 3v: aqua40(spitter)→Database mid WINDUP, null25(scrapbit)→Agent melee SWING! | agent 70% melee | site: Homepage 80%, Database 100%, Gateway 45% | style balanced".`,
       `SWING! = a swing landing within half a second — jump only helps if you are in melee when it lands. WINDUP = telegraphing, still time to reposition.`,
+      `The dive defends a website made physical: three nodes (Homepage, Database, Gateway). Viruses chew them — each virus's →arrow shows its objective (→Agent means it's coming for you). If all three nodes fall, the dive fails. Survive first, but treat a virus chewing a node as your problem: intercept it.`,
     ].join("\n");
   }
 

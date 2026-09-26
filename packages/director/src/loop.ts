@@ -10,6 +10,9 @@ import {
   applyScript,
   rng,
   spawnWave,
+  spawnStructures,
+  nearestStructure,
+  STRUCTURE_REGEN,
   synchroTier,
   tickWorld,
   type Fighter,
@@ -205,6 +208,9 @@ export interface WaveDebriefInput {
   operatorCommands: number;
   mindActions: string[];
   style: string;
+  /** e.g. "Homepage 80%, Database 100%, Gateway DOWN" — remembered, so the
+   *  next dive's mind knows which nodes almost fell */
+  siteStatus?: string;
 }
 
 export interface WaveDebrief {
@@ -221,7 +227,7 @@ const MIND_ACTION_VERBS: Record<string, string> = {
   disengage: "gave ground",
   hold: "held position",
   focus_weakest: "focused the weakest",
-  protect: "covered the operator",
+  protect: "stood guard over the site",
   dodge: "dashed clear",
   jump: "leapt swings",
   orbit: "pivoted around them",
@@ -247,6 +253,7 @@ export function buildWaveDebrief(i: WaveDebriefInput): WaveDebrief {
     parts.push(`Operator gave ${i.operatorCommands} command${i.operatorCommands === 1 ? "" : "s"}.`);
   if (closeCall) parts.push(`Close call — dropped to ${i.minHp}hp.`);
   if (flawless) parts.push(`Flawless — not a scratch.`);
+  if (i.siteStatus) parts.push(`Site: ${i.siteStatus}.`);
 
   let reflection: string;
   if (flawless) {
@@ -269,29 +276,63 @@ export function buildWaveDebrief(i: WaveDebriefInput): WaveDebrief {
 /**
  * Compact tactical snapshot for the mind's decide() — cheap enough to send
  * every 4s, even to a vendor LLM. Read it like a radar readout:
- *   "w2 | 3v: aqua40(spitter) melee SWING!, null25(scrapbit) mid WINDUP | agent 70% melee | style balanced"
+ *   "w2 | 3v: aqua40(spitter)→Database mid WINDUP, null25(scrapbit)→Agent melee SWING! | agent 70% melee | site: Homepage 80%, Database 100%, Gateway 45% | style balanced"
  * SWING! = a swing landing within ~0.5s (jump now or eat it).
  * WINDUP  = telegraphing, still time to reposition.
  * Species in parens lets the mind tell a bulwark's truck-swing from a
  * scrapbit's love-tap — and pick the right script for each.
+ * The →arrow is the virus's objective: →Agent means it's coming for you,
+ * →Homepage/Database/Gateway means it's chewing the site. Lose all three
+ * nodes and the dive fails — defending them IS the mission.
  */
+/**
+ * Between waves the site recompiles: living nodes regain a fraction of maxHp.
+ * Exported for tests.
+ */
+export function regenStructures(world: WorldState): void {
+  for (const s of world.structures ?? [])
+    if (s.hp > 0) s.hp = Math.min(s.maxHp, s.hp + Math.round(s.maxHp * STRUCTURE_REGEN));
+}
+
+/**
+ * One-line site note for the L2 ambient commentary ("3 viruses, agent hp
+ * 80%, Database hurting") — the slow mind gets a cue when a node is in
+ * trouble, and stays quiet about it otherwise.
+ */
+function siteNote(world: WorldState): string {
+  const nodes = (world.structures ?? []).filter((s) => s.hp > 0);
+  if (nodes.length === 0) return "";
+  const worst = nodes.reduce((a, b) => (a.hp / a.maxHp <= b.hp / b.maxHp ? a : b));
+  return worst.hp < worst.maxHp * 0.5 ? `, ${worst.name} hurting` : "";
+}
+
 export function tacticalSituation(world: WorldState, wave: number): string {
   const agent = world.fighters.find((f) => f.kind === "agent");
   if (!agent) return `w${wave} | agent down`;
   const dist2d = (a: { x: number; z: number }, b: { x: number; z: number }) =>
     Math.hypot(a.x - b.x, a.z - b.z);
   const viruses = world.fighters.filter((f) => f.kind === "virus" && f.hp > 0);
+  const structures = world.structures ?? [];
+  const targetName = (v: (typeof viruses)[number]): string => {
+    if (v.targetId === agent.id) return "→Agent";
+    const s = structures.find((s) => s.id === v.targetId);
+    return s ? `→${s.name}` : "";
+  };
   const parts = viruses.map((v) => {
     const band = rangeBandOf(dist2d(agent.pos, v.pos));
     const w = v.windup ?? 0;
     const mark = w > 0.5 ? " WINDUP" : w > 0 ? " SWING!" : "";
-    return `${v.element}${v.hp}(${v.species ?? "scrapbit"}) ${band}${mark}`;
+    return `${v.element}${v.hp}(${v.species ?? "scrapbit"})${targetName(v)} ${band}${mark}`;
   });
   const nearest = viruses.length
     ? rangeBandOf(Math.min(...viruses.map((v) => dist2d(agent.pos, v.pos))))
     : "far";
   const agentHp = Math.round((agent.hp / agent.maxHp) * 100);
-  return `w${wave} | ${viruses.length}v: ${parts.join(", ")} | agent ${agentHp}% ${nearest} | style ${world.style ?? "balanced"}`;
+  const site =
+    structures.length > 0
+      ? structures.map((s) => `${s.name} ${Math.round((s.hp / s.maxHp) * 100)}%`).join(", ")
+      : "none";
+  return `w${wave} | ${viruses.length}v: ${parts.join(", ")} | agent ${agentHp}% ${nearest} | site: ${site} | style ${world.style ?? "balanced"}`;
 }
 
 /** How the mind's decisions reach the sim — same primitives the operator uses. */
@@ -474,6 +515,14 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
       aggression: 0.6,
     }),
   );
+  // The dive has a place: three site nodes the viruses are here to eat.
+  spawnStructures(world);
+  for (const v of world.fighters) {
+    if (v.kind === "virus") {
+      v.targetId = nearestStructure(world, v.pos)?.id;
+      v.retargetIn = Math.random() * 2;
+    }
+  }
 
   let tick = 0;
   let energy = agent.energy;
@@ -794,7 +843,7 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
     // 2. L0 sim tick (free, every tick).
     const agentF = world.fighters.find((f) => f.kind === "agent");
     const situation = agentF
-      ? `${world.fighters.filter((f) => f.kind === "virus" && f.hp > 0).length} viruses, agent hp ${agentF.hp}%${agentF.hp < 30 ? ", hp low" : ""}`
+      ? `${world.fighters.filter((f) => f.kind === "virus" && f.hp > 0).length} viruses, agent hp ${agentF.hp}%${agentF.hp < 30 ? ", hp low" : ""}${siteNote(world)}`
       : "agent down";
     // 2a2. Movement queue: conversational sequences drive the sim one tick at a time.
     while (moveQueue.length > 0 && tick >= moveQueue[0].until) moveQueue.shift();
@@ -889,6 +938,33 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
       setTimeout(() => process.exit(0), 500);
       return;
     }
+    const structures = world.structures ?? [];
+    if (structures.length > 0 && structures.every((s) => s.hp <= 0)) {
+      // The site is gone — nothing left to defend. The dive fails, and the
+      // agent remembers losing it.
+      await convex.mutation(api.agents.appendMemory, {
+        agentId: cfg.agentId as Id<"agents">,
+        kind: "battle",
+        text:
+          `Wave ${wave} (${Math.round((tick - waveStartTick) / 4)}s): the site fell — ` +
+          `Homepage, Database, Gateway all deleted. I couldn't hold it.`,
+      });
+      await convex.mutation(api.session.pushEvent, {
+        sessionId,
+        tick,
+        event: {
+          type: "dialogue",
+          speaker: `${agent.name}.${agent.ext}`,
+          text: `The site's gone, operator... Homepage, Database, Gateway — all dark. Jack me out.`,
+        },
+      });
+      await convex.mutation(api.session.rest, { sessionId });
+      clearInterval(timer);
+      running = false;
+      console.log("[director] site destroyed — dive over. Surfacing.");
+      setTimeout(() => process.exit(0), 500);
+      return;
+    }
     if (virusesAlive === 0 && !resting) {
       // The arena is clear: rest. The next wave waits for the operator —
       // no timer pressure, and the energy clock pauses while they chat.
@@ -908,6 +984,10 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
         operatorCommands: waveCommands,
         mindActions: [...waveMindActions],
         style: world.style ?? "balanced",
+        // Honest pre-regen snapshot — the memory keeps what the wave cost the site.
+        siteStatus: (world.structures ?? [])
+          .map((s) => `${s.name} ${s.hp <= 0 ? "DOWN" : `${Math.round((s.hp / s.maxHp) * 100)}%`}`)
+          .join(", "),
       });
       await convex.mutation(api.agents.appendMemory, {
         agentId: cfg.agentId as Id<"agents">,
@@ -922,13 +1002,20 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
       });
       a.hp = Math.min(a.maxHp, a.hp + 25); // catch your breath between waves
       synchro = Math.min(100, synchro + 10);
+      // The site recompiles between waves — living nodes knit themselves back.
+      regenStructures(world);
+      const siteNodes = world.structures ?? [];
+      const siteReport =
+        siteNodes.length > 0
+          ? siteNodes.map((s) => `${s.name} ${Math.round((s.hp / s.maxHp) * 100)}%`).join(", ")
+          : "no site";
       await convex.mutation(api.session.pushEvent, {
         sessionId,
         tick,
         event: {
           type: "dialogue",
           speaker: `${agent.name}.${agent.ext}`,
-          text: `Wave ${wave} cleared — nice coaching, operator. Catch your breath. Say "next wave" when you're ready.`,
+          text: `Wave ${wave} cleared — nice coaching, operator. The site's recompiling: ${siteReport}. Say "next wave" when you're ready.`,
         },
       });
       // The agent reflects on the wave out loud — the memory system, visible.
@@ -1107,7 +1194,9 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
       tick,
       synchro,
       // Corpses get 1 second of "down" pose so the death reads, then vanish.
-      entities: visibleFighters(world.fighters, downAt, tick).map((f) => ({
+      entities: [
+        // Corpses get 1 second of "down" pose so the death reads, then vanish.
+        ...visibleFighters(world.fighters, downAt, tick).map((f) => ({
           entityId: f.id,
           kind: f.kind,
           name: f.name,
@@ -1119,6 +1208,22 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
           maxHp: f.maxHp,
           element: f.element,
         })),
+        // Site nodes — the physical website. Fallen ones vanish like corpses.
+        ...(world.structures ?? [])
+          .filter((s) => s.hp > 0)
+          .map((s) => ({
+            entityId: s.id,
+            kind: "structure" as const,
+            name: s.name,
+            x: s.pos.x,
+            y: 0,
+            z: s.pos.z,
+            pose: "idle",
+            hp: s.hp,
+            maxHp: s.maxHp,
+            element: "null",
+          })),
+      ],
     });
 
     // 5. L2 heartbeat, slow cadence: the agent comments on the fight.
