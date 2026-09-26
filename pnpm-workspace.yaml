@@ -1,0 +1,5 @@
+packages:
+  - "packages/*"
+  - "convex"
+allowBuilds:
+  esbuild: true

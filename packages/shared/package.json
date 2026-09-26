@@ -1,0 +1,1 @@
+{"dependencies":{"zod":"^3.24.0"},"devDependencies":{"typescript":"^5.7.0"},"exports":{".":"./dist/index.js"},"main":"./dist/index.js","name":"@agent-game/shared","scripts":{"build":"tsc -p tsconfig.json","test":"echo 'no tests in shared (contract only)'","typecheck":"tsc -p tsconfig.json --noEmit"},"type":"module","types":"./dist/index.d.ts","version":"0.1.0"}
