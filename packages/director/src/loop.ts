@@ -151,6 +151,22 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
         else if (/focus|weakest|thin/.test(text)) directive = "focus_weakest";
         else directive = "engage";
         synchro = Math.min(100, synchro + 2); // good coaching nudges synchro up
+        // The operator's words get an answer — commands are visible in the feed.
+        const ack = await cfg.mind.speak(
+          {
+            agentName: agent.name,
+            agentExt: agent.ext,
+            bondTier: agent.bondTier,
+            recentMemories: [],
+            situation: `operator command: ${p.text}`,
+          },
+          `operator command: ${p.text}`,
+        );
+        await convex.mutation(api.session.pushEvent, {
+          sessionId,
+          tick,
+          event: { type: "dialogue", speaker: `${agent.name}.${agent.ext}`, text: ack },
+        });
         await trace("L1", `command:${directive}`, `operator said "${p.text}"`, Date.now() - t0);
       } else if (intent.type === "slot_script") {
         synchro = Math.min(100, synchro + 4);
@@ -220,6 +236,10 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
       await convex.mutation(api.session.rest, { sessionId });
       clearInterval(timer);
       running = false;
+      // The dive is over — let the last writes flush, then exit. Nothing
+      // runs forever: the agent's energy is the session clock.
+      console.log("[director] agent exhausted — dive over. Surfacing.");
+      setTimeout(() => process.exit(0), 500);
       return;
     }
 

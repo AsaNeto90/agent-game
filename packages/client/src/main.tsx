@@ -4,6 +4,7 @@ import { createRoot } from "react-dom/client";
 import * as THREE from "three";
 import { api } from "../../../convex/_generated/api.js";
 import type { Id } from "../../../convex/_generated/dataModel.js";
+import type { BrainEvent } from "@agent-game/shared";
 
 const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL as string);
 
@@ -140,7 +141,47 @@ function Hud({ sessionId }: { sessionId: Id<"sessions"> }) {
   const send = (type: "command" | "slot_script" | "suggest_destination" | "chat", payload: object) =>
     sendIntent({ sessionId, type, payload });
 
-  const dialogues = (snapshot?.events ?? []).filter((e) => (e as { type: string }).type === "dialogue");
+  const events = (snapshot?.events ?? []) as BrainEvent[];
+
+  const prettyId = (id: string) =>
+    id.startsWith("agent-") ? "Agent" : id.startsWith("virus-") ? `Virus ${id.slice(6)}` : id;
+
+  const renderEvent = (e: BrainEvent, i: number) => {
+    switch (e.type) {
+      case "dialogue":
+        return (
+          <div key={i}>
+            <b>{e.speaker}:</b> {e.text}
+          </div>
+        );
+      case "script_fired":
+        return (
+          <div key={i} style={{ color: "#ffd76a" }}>
+            ⚡ <b>{prettyId(e.byId)}</b> fired <b>{e.scriptId}</b>
+          </div>
+        );
+      case "hit":
+        return (
+          <div key={i} style={{ color: "#ff8a8a" }}>
+            💥 {prettyId(e.attackerId)} → {prettyId(e.targetId)} · {e.damage}
+          </div>
+        );
+      case "bond_changed":
+        return (
+          <div key={i} style={{ color: "#8ad8ff" }}>
+            💠 Bond rising — {e.tier} ({e.xp} xp)
+          </div>
+        );
+      case "digest":
+        return (
+          <div key={i} style={{ fontStyle: "italic", opacity: 0.8 }}>
+            {e.text}
+          </div>
+        );
+      default:
+        return null; // synchro/energy already have their own bars
+    }
+  };
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", padding: 12, gap: 8 }}>
@@ -160,14 +201,7 @@ function Hud({ sessionId }: { sessionId: Id<"sessions"> }) {
       </div>
 
       <div ref={feedRef} style={{ flex: 1, overflowY: "auto", fontSize: 13, lineHeight: 1.5 }}>
-        {dialogues.map((d, i) => {
-          const e = d as { speaker: string; text: string };
-          return (
-            <div key={i}>
-              <b>{e.speaker}:</b> {e.text}
-            </div>
-          );
-        })}
+        {events.map(renderEvent)}
       </div>
 
       <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
