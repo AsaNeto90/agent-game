@@ -197,3 +197,6 @@ export type DecisionTrace = z.infer<typeof DecisionTrace>;
 
 /** The 12-Script Starter Kit every new operator gets. */
 export { STARTER_SCRIPTS } from "./starter-scripts.js";
+
+/** The compile flow: identity, temperament, chassis hook, wake. */
+export * from "./compile.js";

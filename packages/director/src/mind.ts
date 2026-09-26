@@ -6,7 +6,7 @@
  *   - MockMind: deterministic, scripted, $0. Tests + offline dev.
  *   - VendorMind (later): Anthropic / OpenAI / local model behind one shape.
  */
-import type { Element } from "@agent-game/shared";
+import type { Drives, Element } from "@agent-game/shared";
 
 export interface MindContext {
   agentName: string;
@@ -25,6 +25,11 @@ export interface MindContext {
   scriptRequested?: boolean;
   /** Current synchro value — the mind needs it to time the unison finisher. */
   synchro?: number;
+  /** Compile-time temperament traits (e.g. "bold", "cautious") — shape the
+   *  mind's risk appetite. Absent for agents compiled before w-compile. */
+  traits?: string[];
+  /** Compile-time drives 0-10: curiosity, sociability, duty, ambition. */
+  drives?: Drives;
 }
 
 export interface MindDecision {
@@ -148,7 +153,12 @@ export class MockMind implements MindProvider {
       return withScript({ action: "orbit", rationale: "pivoting around them, operator" });
     }
     // Hurt -> disengage and go evasive on your own. No keyword required.
-    if (agentHp < 35) {
+    // Temperament shapes risk appetite: a cautious agent bails earlier, a
+    // bold one holds its nerve longer. Unprofiled agents (compiled before
+    // the compile flow) keep the old 35 line.
+    const traits = ctx.traits ?? [];
+    const panicAt = traits.includes("cautious") ? 45 : traits.includes("bold") ? 25 : 35;
+    if (agentHp < panicAt) {
       return withScript({ action: "disengage", style: "evasive", rationale: "hurt — going evasive" });
     }
     // The unison: when the meter's hot and something big is on the scope,
@@ -247,8 +257,12 @@ export class MockMind implements MindProvider {
     if (/hello|hi\b|hey|yo\b|morning/i.test(prompt))
       return `Hey. ${tag} here — bond's at ${ctx.bondTier}. What's the plan?`;
     if (/thank|thanks|thx|nice|good job|well done|awesome/i.test(prompt)) return `Heh. All in a day's dive.`;
-    if (/who are you|your name|introduce/i.test(prompt))
-      return `${tag} — your agent. Compiled, bonded, and itching for a fight.`;
+    if (/who are you|your name|introduce/i.test(prompt)) {
+      const t = (ctx.traits ?? []).join("/");
+      return t
+        ? `${tag} — your ${t} agent. Compiled, bonded, and itching for a fight.`
+        : `${tag} — your agent. Compiled, bonded, and itching for a fight.`;
+    }
     if (/\?\s*$/.test(prompt)) return `My call: we press the advantage.`;
 
     const lines = [

@@ -1,12 +1,88 @@
 import { ConvexProvider, ConvexReactClient, useMutation, useQuery } from "convex/react";
 import { StrictMode, useEffect, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import { createRoot } from "react-dom/client";
 import * as THREE from "three";
 import { api } from "../../../convex/_generated/api.js";
 import type { Id } from "../../../convex/_generated/dataModel.js";
+import type { FunctionReference } from "convex/server";
 import type { BrainEvent } from "@agent-game/shared";
+import { CompileInput, TEMPERAMENT_QUESTIONS, wakeIntro, WAKE_QUESTION } from "@agent-game/shared";
 
 const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL as string);
+
+/**
+ * w-compile: the compile flow (FR-01). agents:list, agents:decommission, and
+ * the new compile() args don't exist in the generated api types yet — they
+ * land on `npx convex dev`. The runtime references are identical; only the
+ * types are widened here. The doc type is widened the same way.
+ */
+type AgentDoc = {
+  _id: Id<"agents">;
+  name: string;
+  ext: string;
+  bondTier: string;
+  traits?: string[];
+  drives?: { curiosity: number; sociability: number; duty: number; ambition: number };
+  chassis?: string;
+  retired?: boolean;
+  createdAt: number;
+};
+
+const agentsCompile = api.agents.compile as unknown as FunctionReference<
+  "mutation",
+  "public",
+  { name: string; ext: string; answers: string[] },
+  string
+>;
+const agentsDecommission = (api.agents as unknown as Record<string, unknown>)
+  .decommission as FunctionReference<"mutation", "public", { agentId: Id<"agents"> }, null>;
+
+const AGENT_ID_KEY = "deck.agentId";
+
+const btnPrimary: CSSProperties = {
+  padding: "8px 16px",
+  margin: "4px 8px 4px 0",
+  background: "#00e5ff",
+  color: "#04121a",
+  border: "none",
+  borderRadius: 4,
+  fontWeight: "bold",
+  cursor: "pointer",
+};
+const btnGhost: CSSProperties = {
+  padding: "8px 16px",
+  margin: "4px 8px 4px 0",
+  background: "transparent",
+  color: "#9fd8e8",
+  border: "1px solid #1e4a5a",
+  borderRadius: 4,
+  cursor: "pointer",
+};
+const linkBtn: CSSProperties = {
+  background: "none",
+  border: "none",
+  color: "#7fb3c8",
+  textDecoration: "underline",
+  cursor: "pointer",
+  padding: 0,
+};
+const inputStyle: CSSProperties = {
+  width: 320,
+  marginRight: 8,
+  padding: 8,
+  background: "#0a1420",
+  color: "#d7f4ff",
+  border: "1px solid #1e4a5a",
+  borderRadius: 4,
+};
+const errStyle: CSSProperties = { color: "#ff7a7a" };
+const codeStyle: CSSProperties = {
+  background: "#122",
+  padding: "4px 8px",
+  borderRadius: 4,
+  fontFamily: "monospace",
+};
 
 const ELEMENT_COLORS: Record<string, number> = {
   fire: 0xff5533,
@@ -387,7 +463,307 @@ const panelStyle: React.CSSProperties = {
  * - director running  -> subscribe to its live session
  * - nothing diving    -> say so, instead of rendering an empty void
  */
-function DiveConsole({ diveId, onReset }: { diveId: string; onReset: () => void }) {
+/**
+ * The compile flow: identity -> temperament -> (chassis: deferred) -> wake.
+ * One agent per profile (V1): when `existing` is set, the flow opens on a
+ * confirmation step — recompiling retires the old agent, it never deletes.
+ */
+function CompileScreen({
+  existing,
+  onDone,
+  onCancel,
+  onAdoptId,
+}: {
+  existing: AgentDoc | null;
+  onDone: (agentId: string) => void;
+  onCancel?: () => void;
+  onAdoptId: (agentId: string) => void;
+}) {
+  const [step, setStep] = useState<"confirm" | "identity" | "temperament" | "wake" | "done">(
+    existing ? "confirm" : "identity",
+  );
+  const [name, setName] = useState("");
+  const [ext, setExt] = useState<"PY" | "SH" | "MD">("PY");
+  const [answers, setAnswers] = useState<string[]>(["", "", ""]);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [agentId, setAgentId] = useState<string | null>(null);
+  const [wakeAnswer, setWakeAnswer] = useState("");
+  const [pasteId, setPasteId] = useState("");
+  const [showPaste, setShowPaste] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  const compileAgent = useMutation(agentsCompile);
+  const decommission = useMutation(agentsDecommission);
+  const appendMemory = useMutation(api.agents.appendMemory);
+  const profile = useQuery(
+    api.agents.get,
+    agentId ? { agentId: agentId as Id<"agents"> } : "skip",
+  ) as unknown as AgentDoc | null | undefined;
+  const wakeLines = profile
+    ? wakeIntro({ name: profile.name, ext: profile.ext, traits: profile.traits ?? [] })
+    : null;
+
+  const fail = (e: unknown) => {
+    const msg = e instanceof Error ? e.message : String(e);
+    setError(msg.replace(/^.*Error:\s*/, "").slice(0, 280));
+  };
+
+  const nextFromIdentity = () => {
+    const check = CompileInput.shape.name.safeParse(name);
+    if (!check.success) {
+      setError(check.error.issues[0]?.message ?? "That name won't compile.");
+      return;
+    }
+    setError(null);
+    setStep("temperament");
+  };
+
+  const submitTemperament = async () => {
+    setError(null);
+    setBusy(true);
+    try {
+      const id = await compileAgent({ name: name.trim(), ext, answers });
+      if (existing) await decommission({ agentId: existing._id });
+      setAgentId(id);
+      setStep("wake");
+    } catch (e) {
+      fail(e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const finishWake = async (withAnswer: boolean) => {
+    if (agentId && withAnswer && wakeAnswer.trim()) {
+      try {
+        await appendMemory({
+          agentId: agentId as Id<"agents">,
+          kind: "preference",
+          text: `Wake question — "${WAKE_QUESTION}" The operator answered: "${wakeAnswer.trim().slice(0, 280)}"`,
+        });
+      } catch {
+        // Memory is a nicety; the agent exists regardless.
+      }
+    }
+    if (agentId) setStep("done");
+  };
+
+  const copyAgentId = async () => {
+    if (!agentId) return;
+    try {
+      await navigator.clipboard.writeText(agentId);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1600);
+    } catch {
+      // Clipboard unavailable (non-secure context) — the id stays visible to copy by hand.
+    }
+  };
+
+  if (step === "confirm" && existing) {
+    return (
+      <div style={panelStyle}>
+        <h2>COMPILE A NEW AGENT?</h2>
+        <p>
+          You already have{" "}
+          <b>
+            {existing.name}.{existing.ext}
+          </b>{" "}
+          (bond: {existing.bondTier}). Compiling a new agent <b>retires</b> them — their
+          memories stay on record, but they won't dive again.
+        </p>
+        <p>No permanent build choice is made without confirmation — this is yours.</p>
+        <button onClick={() => setStep("identity")} style={btnPrimary}>
+          Compile a new agent
+        </button>
+        {onCancel && (
+          <button onClick={onCancel} style={btnGhost}>
+            Keep {existing.name}
+          </button>
+        )}
+        {error && <p style={errStyle}>{error}</p>}
+      </div>
+    );
+  }
+
+  if (step === "temperament") {
+    return (
+      <div style={panelStyle}>
+        <h2>TEMPERAMENT</h2>
+        <p>Three questions. Answer honestly — this shapes who they are.</p>
+        {TEMPERAMENT_QUESTIONS.map((q, qi) => (
+          <div key={q.id} style={{ margin: "16px 0" }}>
+            <p>
+              <b>
+                {qi + 1}. {q.prompt}
+              </b>
+            </p>
+            <div>
+              {q.choices.map((c) => (
+                <button
+                  key={c.id}
+                  onClick={() => setAnswers((a) => a.map((v, i) => (i === qi ? c.id : v)))}
+                  style={answers[qi] === c.id ? btnPrimary : btnGhost}
+                >
+                  {c.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        ))}
+        {error && <p style={errStyle}>{error}</p>}
+        <button
+          onClick={submitTemperament}
+          disabled={busy || answers.some((a) => !a)}
+          style={btnPrimary}
+        >
+          {busy ? "Compiling…" : "Compile"}
+        </button>
+        {/* CHASSIS STEP (deferred): when the Chassis system ships, its picker
+            renders here — between temperament and wake — per
+            COMPILE_FLOW_STEPS in @agent-game/shared. Not built in V1. */}
+      </div>
+    );
+  }
+
+  if (step === "wake" && agentId) {
+    return (
+      <div style={panelStyle}>
+        <h2>{profile ? `${profile.name}.${profile.ext} IS AWAKE` : "WAKING UP…"}</h2>
+        {!wakeLines && <p>Contacting cyberspace…</p>}
+        {wakeLines && profile && (
+          <>
+            {wakeLines.slice(0, 3).map((line, i) => (
+              <p key={i}>
+                <b>{profile.name}:</b> {line}
+              </p>
+            ))}
+            <p style={{ fontStyle: "italic", marginTop: 16 }}>
+              <b>{profile.name}:</b> {wakeLines[3]}
+            </p>
+            <input
+              value={wakeAnswer}
+              onChange={(e) => setWakeAnswer(e.target.value)}
+              placeholder="One thing to remember…"
+              maxLength={280}
+              style={inputStyle}
+            />
+            <div style={{ marginTop: 8 }}>
+              <button onClick={() => finishWake(true)} style={btnPrimary}>
+                Answer & continue
+              </button>
+              <button onClick={() => finishWake(false)} style={btnGhost}>
+                Skip
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    );
+  }
+
+  // done — the "dive your agent" panel. The compile flow used to drop the
+  // operator straight back at the deck with no hint that the director only
+  // dives the agent in its AGENT_ID, which stranded people in a
+  // Find dive -> NO ACTIVE DIVE loop. This panel closes that gap.
+  if (step === "done" && agentId) {
+    return (
+      <div style={panelStyle}>
+        <h2>{profile ? `${profile.name}.${profile.ext} IS READY` : "AGENT COMPILED"}</h2>
+        <p>
+          One last step, operator: the director only dives the agent whose id is in its{" "}
+          <code style={codeStyle}>AGENT_ID</code>. Point it at your new agent:
+        </p>
+        <ol>
+          <li>
+            In <code style={codeStyle}>packages/director/.env</code>, set{" "}
+            <code style={codeStyle}>AGENT_ID={agentId}</code>
+          </li>
+          <li>
+            Run <code style={codeStyle}>pnpm --filter @agent-game/director dev</code>
+          </li>
+          <li>Come back here and hit Find dive.</li>
+        </ol>
+        <p style={{ marginTop: 16 }}>Agent id — click to copy:</p>
+        <p>
+          <code
+            onClick={copyAgentId}
+            title="Click to copy"
+            style={{ ...codeStyle, cursor: "pointer", wordBreak: "break-all" }}
+          >
+            {agentId}
+          </code>{" "}
+          <button onClick={copyAgentId} style={btnGhost}>
+            {copied ? "Copied!" : "Copy id"}
+          </button>
+        </p>
+        <div style={{ marginTop: 16 }}>
+          <button onClick={() => onDone(agentId)} style={btnPrimary}>
+            Continue to deck
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // identity (the default step)
+  return (
+    <div style={panelStyle}>
+      <h2>COMPILE YOUR AGENT</h2>
+      <p>Name them. In Navi culture, being named is what makes you real.</p>
+      <input
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        placeholder="e.g. Nova"
+        maxLength={24}
+        style={inputStyle}
+      />
+      <p style={{ marginTop: 16 }}>Soul extension — flavor only, for now:</p>
+      <div>
+        {(["PY", "SH", "MD"] as const).map((e) => (
+          <button key={e} onClick={() => setExt(e)} style={ext === e ? btnPrimary : btnGhost}>
+            .{e}
+          </button>
+        ))}
+      </div>
+      {error && <p style={errStyle}>{error}</p>}
+      <div style={{ marginTop: 8 }}>
+        <button onClick={nextFromIdentity} style={btnPrimary}>
+          Next
+        </button>
+      </div>
+      {!showPaste ? (
+        <p style={{ marginTop: 24, opacity: 0.7 }}>
+          <button onClick={() => setShowPaste(true)} style={linkBtn}>
+            Already compiled? Paste your agent id
+          </button>
+        </p>
+      ) : (
+        <p style={{ marginTop: 24 }}>
+          <input
+            value={pasteId}
+            onChange={(e) => setPasteId(e.target.value)}
+            placeholder="agent id"
+            style={inputStyle}
+          />
+          <button onClick={() => pasteId.trim() && onAdoptId(pasteId.trim())} style={btnGhost}>
+            Use this agent
+          </button>
+        </p>
+      )}
+    </div>
+  );
+}
+
+function DiveConsole({
+  diveId,
+  agent,
+  onReset,
+}: {
+  diveId: string;
+  agent: AgentDoc | null | undefined;
+  onReset: () => void;
+}) {
   const result = useQuery(api.session.findDive, { id: diveId });
 
   if (result === undefined) {
@@ -410,14 +786,22 @@ function DiveConsole({ diveId, onReset }: { diveId: string; onReset: () => void 
   }
 
   if (result.sessionId === null) {
+    // Name the agent we're waiting for — the pre-x-divehint screen never said
+    // WHOSE dive it was waiting on, which made the AGENT_ID mismatch invisible.
+    const who = agent ? `${agent.name}.${agent.ext}` : "this agent";
     return (
       <div style={panelStyle}>
         <h2>NO ACTIVE DIVE</h2>
-        <p>This agent isn't diving right now. The director — the brain's heartbeat — needs to be running:</p>
         <p>
-          <code style={{ background: "#122", padding: "4px 8px" }}>
-            pnpm --filter @agent-game/director dev
-          </code>
+          Waiting for a dive for <b>{who}</b> (<code style={codeStyle}>…{diveId.slice(-4)}</code>).
+        </p>
+        <p>
+          The director — the brain's heartbeat — needs{" "}
+          <code style={codeStyle}>AGENT_ID={diveId}</code> in{" "}
+          <code style={codeStyle}>packages/director/.env</code> and to be running:
+        </p>
+        <p>
+          <code style={codeStyle}>pnpm --filter @agent-game/director dev</code>
         </p>
         <p>Start it and this screen will connect on its own. Either boot order works.</p>
         <button onClick={onReset}>Try another id</button>
@@ -582,32 +966,148 @@ function DiveScreen({ sessionId }: { sessionId: Id<"sessions"> }) {  const snaps
 }
 
 function App() {
-  const [input, setInput] = useState("");
+  const [agentId, setAgentId] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem(AGENT_ID_KEY);
+    } catch {
+      return null;
+    }
+  });
+  const [screen, setScreen] = useState<"start" | "compile" | "dive">("start");
   const [diveId, setDiveId] = useState<string | null>(null);
 
-  if (!diveId) {
+  const stored = useQuery(
+    api.agents.get,
+    agentId ? { agentId: agentId as Id<"agents"> } : "skip",
+  ) as unknown as AgentDoc | null | undefined;
+
+  const adopt = (id: string) => {
+    try {
+      localStorage.setItem(AGENT_ID_KEY, id);
+    } catch {
+      // Private mode — the id just won't persist.
+    }
+    setAgentId(id);
+  };
+  const forget = () => {
+    try {
+      localStorage.removeItem(AGENT_ID_KEY);
+    } catch {
+      // ignore
+    }
+    setAgentId(null);
+  };
+
+  if (screen === "dive" && diveId) {
+    return (
+      <DiveConsole
+        diveId={diveId}
+        agent={stored}
+        onReset={() => {
+          setDiveId(null);
+          setScreen("start");
+        }}
+      />
+    );
+  }
+
+  if (screen === "compile") {
+    if (agentId && stored === undefined) {
+      return (
+        <div style={panelStyle}>
+          <h2>DIVE CONSOLE</h2>
+          <p>Contacting cyberspace…</p>
+        </div>
+      );
+    }
+    return (
+      <CompileScreen
+        existing={stored && !stored.retired ? stored : null}
+        onDone={(id) => {
+          adopt(id);
+          setScreen("start");
+        }}
+        onCancel={() => setScreen("start")}
+        onAdoptId={(id) => {
+          adopt(id);
+          setScreen("start");
+        }}
+      />
+    );
+  }
+
+  // start screen
+  if (!agentId) {
+    return (
+      <CompileScreen
+        existing={null}
+        onDone={(id) => {
+          adopt(id);
+          setScreen("start");
+        }}
+        onAdoptId={(id) => {
+          adopt(id);
+          setScreen("start");
+        }}
+      />
+    );
+  }
+
+  if (stored === undefined) {
     return (
       <div style={panelStyle}>
         <h2>DIVE CONSOLE</h2>
-        <p>
-          Paste an agent id (compile one first:{" "}
-          <code>{`npx convex run agents:compile '{"name":"AstroMan","ext":"PY"}'`}</code>
-          ) or the session id the director prints, then dive.
-        </p>
-        <input
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          placeholder="agent id or session id"
-          style={{ width: 320, marginRight: 8 }}
-        />
-        <button onClick={() => input.trim() && setDiveId(input.trim())}>
-          Find dive
-        </button>
+        <p>Contacting cyberspace…</p>
       </div>
     );
   }
 
-  return <DiveConsole diveId={diveId} onReset={() => setDiveId(null)} />;
+  if (stored === null || stored.retired) {
+    // Stored id points at nothing (or a retired agent) — back to compile.
+    return (
+      <CompileScreen
+        existing={null}
+        onDone={(id) => {
+          adopt(id);
+          setScreen("start");
+        }}
+        onAdoptId={(id) => {
+          adopt(id);
+          setScreen("start");
+        }}
+      />
+    );
+  }
+
+  return (
+    <div style={panelStyle}>
+      <h2>DIVE CONSOLE</h2>
+      <p>
+        Operator of{" "}
+        <b>
+          {stored.name}.{stored.ext}
+        </b>{" "}
+        — bond: {stored.bondTier}.
+      </p>
+      <button
+        onClick={() => {
+          setDiveId(agentId);
+          setScreen("dive");
+        }}
+        style={btnPrimary}
+      >
+        Find dive
+      </button>
+      <button onClick={() => setScreen("compile")} style={btnGhost}>
+        Compile a new agent
+      </button>
+      <p style={{ marginTop: 16, opacity: 0.7 }}>
+        <button onClick={forget} style={linkBtn}>
+          Forget this agent
+        </button>
+      </p>
+    </div>
+  );
 }
 
 createRoot(document.getElementById("root")!).render(

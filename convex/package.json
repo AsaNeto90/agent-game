@@ -1,0 +1,1 @@
+{"dependencies":{"@agent-game/shared":"workspace:*"},"devDependencies":{"convex-test":"^0.0.60","vitest":"^2.1.0"},"name":"@agent-game/convex","private":true,"scripts":{"test":"vitest run"},"type":"module"}

@@ -22,7 +22,7 @@ import {
   type FightStyle,
   type WorldState,
 } from "./world.js";
-import { STARTER_SCRIPTS, rangeBandOf, type Element } from "@agent-game/shared";
+import { STARTER_SCRIPTS, rangeBandOf, type Drives, type Element } from "@agent-game/shared";
 
 const TICK_MS = 250;
 const ENERGY_DRAIN_PER_TICK = 0.08; // ~100 energy ≈ 5 min of diving
@@ -483,6 +483,13 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
   });
   if (!agent) throw new Error(`agent ${cfg.agentId} not found — compile one first (agents:compile)`);
 
+  // w-compile: the agent's compiled profile. The generated Convex types (and
+  // the committed convex/*.js they derive from) refresh on `npx convex dev`;
+  // until then — and for agent rows compiled before this patch — read
+  // defensively. Old agents simply dive unprofiled.
+  const agentTraits: string[] = (agent as { traits?: string[] }).traits ?? [];
+  const agentDrives: Drives | undefined = (agent as { drives?: Drives }).drives;
+
   // Recall: what the agent remembers from past dives. Loaded once at boot,
   // appended locally after each wave debrief — no re-query mid-dive.
   const memoryLines = (
@@ -634,6 +641,8 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
           bondTier: agent.bondTier,
           recentMemories: memoryLines,
           situation,
+          traits: agentTraits,
+          drives: agentDrives,
         },
         prompt,
       )
@@ -737,6 +746,8 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
             bondTier: agent.bondTier,
             recentMemories: memoryLines,
             situation: "dive start",
+            traits: agentTraits,
+            drives: agentDrives,
           },
           "dive start",
         ),
@@ -1173,6 +1184,8 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
           synchro, // the mind needs the meter to time the unison
           scriptsReady: readyIds,
           scriptRequested: wantedScript,
+          traits: agentTraits,
+          drives: agentDrives,
           operatorLines: recentOperatorLines
             .filter((l) => tick - l.tick < 120)
             .map((l) => l.text)

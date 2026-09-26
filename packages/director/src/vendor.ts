@@ -98,6 +98,7 @@ export class VendorMind implements MindProvider {
   private decideSystem(ctx: MindContext): string {
     return [
       `You are the combat instincts of ${ctx.agentName}.${ctx.agentExt}, a battle companion program fighting rogue viruses in cyberspace while a human operator coaches in real time.`,
+      this.temperamentBlock(ctx),
       this.memoryBlock(ctx),
       `Read the situation and pick ONE action. Reply with ONLY a JSON object, no other text:`,
       `{"action": "<one of engage|disengage|hold|focus_weakest|protect|dodge|jump|orbit|strafe|unison>", "style": "<evasive|balanced|null>", "rationale": "<under 12 words>", "script": "<optional script id, or omit>"}`,
@@ -123,11 +124,29 @@ export class VendorMind implements MindProvider {
   private speakSystem(ctx: MindContext): string {
     return [
       `You are ${ctx.agentName}.${ctx.agentExt}, a loyal battle companion program. Your operator coaches you through real-time combat against viruses in cyberspace.`,
+      this.temperamentBlock(ctx),
       `Personality: brave, a little cocky, talks like a sparring partner who genuinely likes their operator.`,
       `Rules: one or two sentences, never more. Plain text only — no stage directions, no quotation marks around the reply, no emojis. Never break character. Never mention being an AI or language model.`,
       `Current situation: ${ctx.situation}. Bond tier with operator: ${ctx.bondTier}.`,
       this.memoryBlock(ctx),
     ].join("\n");
+  }
+
+  /**
+   * Compile-flow temperament — who this agent is. Empty for agents compiled
+   * before w-compile; the mock and vendor both degrade gracefully.
+   */
+  private temperamentBlock(ctx: MindContext): string {
+    const traits = ctx.traits ?? [];
+    const d = ctx.drives;
+    if (traits.length === 0 && !d) return "";
+    const driveLine = d
+      ? ` Drives (0-10): curiosity ${d.curiosity}, sociability ${d.sociability}, duty ${d.duty}, ambition ${d.ambition}.`
+      : "";
+    return (
+      `Temperament: ${traits.join(", ") || "unprofiled"}.${driveLine}` +
+      ` Let it color your instincts — a bold agent presses the attack, a cautious one values its armor, a loyal one fights for its operator.`
+    );
   }
 
   private async chat(system: string, user: string, maxTokens: number): Promise<string | null> {

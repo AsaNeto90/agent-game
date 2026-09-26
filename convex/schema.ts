@@ -29,6 +29,20 @@ export default defineSchema({
       aegis: v.number(),
       paragon: v.number(),
     }),
+    // Compile-flow profile (w-compile). Optional until existing agents are
+    // backfilled — new compiles always write these.
+    traits: v.optional(v.array(v.string())),
+    drives: v.optional(
+      v.object({
+        curiosity: v.number(),
+        sociability: v.number(),
+        duty: v.number(),
+        ambition: v.number(),
+      }),
+    ),
+    chassis: v.optional(v.string()),
+    voice: v.optional(v.string()), // voice profile stub
+    retired: v.optional(v.boolean()), // set by decommission; list() hides these
     lattice: v.any(), // woven program parts config
     homeNode: v.string(),
     createdAt: v.number(),

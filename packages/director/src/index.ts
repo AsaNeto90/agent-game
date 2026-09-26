@@ -4,8 +4,8 @@
  *   pnpm dev            # local, against your Convex dev deployment
  *
  * Needs CONVEX_URL + AGENT_ID in .env (copy .env.example).
- * Compile an agent first via the Convex dashboard or:
- *   npx convex run agents:compile '{"name":"AstroMan","ext":"PY"}'
+ * Compile an agent first (the deck UI walks through it) or:
+ *   npx convex run agents:compile '{"name":"AstroMan","ext":"PY","answers":["a","b","c"]}'
  */
 import dotenv from "dotenv";
 import path from "node:path";
