@@ -10,6 +10,7 @@ import {
   parseMoveSequence,
   regenStructures,
   tacticalSituation,
+  unisonGate,
   visibleFighters,
   type MovePrimitive,
 } from "./loop.js";
@@ -585,5 +586,49 @@ describe("site defense loop", () => {
     });
     expect(d.memory).toContain("Site: Homepage 80%, Database 100%, Gateway DOWN.");
     expect(d.memory).toContain("stood guard over the site");
+  });
+});
+
+describe("unisonGate", () => {
+  it("opens at 80+ synchro on a fresh dive", () => {
+    expect(unisonGate(80, false)).toBe("ok");
+    expect(unisonGate(100, false)).toBe("ok");
+  });
+
+  it("rejects below 80 — the meter has to be hot", () => {
+    expect(unisonGate(79, false)).toBe("not_in_sync");
+    expect(unisonGate(40, false)).toBe("not_in_sync");
+    expect(unisonGate(0, false)).toBe("not_in_sync");
+  });
+
+  it("enforces one use per dive even at full synchro", () => {
+    expect(unisonGate(100, true)).toBe("already_used");
+    expect(unisonGate(80, true)).toBe("already_used");
+  });
+});
+
+describe("applyMindDecision unison", () => {
+  it("logs the finisher without setting a stance", () => {
+    const calls: { queue: unknown[][]; maneuver: unknown[][]; style: string[] } = {
+      queue: [],
+      maneuver: [],
+      style: [],
+    };
+    const act = {
+      queue: (seq: MovePrimitive[], t: number) => calls.queue.push([seq, t]),
+      maneuver: (d: "engage" | "disengage" | "hold" | "focus_weakest" | "protect", until: number) =>
+        calls.maneuver.push([d, until]),
+      setStyle: (s: "balanced" | "evasive") => calls.style.push(s),
+    };
+    const summary = applyMindDecision(
+      { fighters: [], events: [] },
+      { action: "unison", rationale: "deleting the big one" },
+      100,
+      act,
+      { styleLocked: false, queueBusy: false },
+    );
+    expect(summary).toContain("unison");
+    expect(calls.maneuver).toHaveLength(0); // not a stance — the loop fires it
+    expect(calls.queue).toHaveLength(0);
   });
 });

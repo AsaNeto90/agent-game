@@ -481,8 +481,65 @@ function WaveBanner({ events }: { events: BrainEvent[] }) {
   );
 }
 
-function DiveScreen({ sessionId }: { sessionId: Id<"sessions"> }) {
-  const snapshot = useQuery(api.session.snapshot, { sessionId });
+/** Unison banner — full-screen flash + title card when the finisher fires.
+ * Keys off the UNISON! dialogue event, the same trick as the wave banners. */
+function UnisonBanner({ events }: { events: BrainEvent[] }) {
+  const [show, setShow] = useState(false);
+  const lastKey = useRef<string | null>(null);
+  useEffect(() => {
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i];
+      if (e.type !== "dialogue" || typeof e.text !== "string") continue;
+      if (/UNISON!/.test(e.text)) {
+        const key = `unison:${i}`;
+        if (lastKey.current !== key) {
+          lastKey.current = key;
+          setShow(true);
+          const t = setTimeout(() => setShow(false), 1800);
+          return () => clearTimeout(t);
+        }
+        break;
+      }
+    }
+  }, [events]);
+  if (!show) return null;
+  return (
+    <div
+      style={{
+        position: "absolute",
+        inset: 0,
+        pointerEvents: "none",
+        animation: "unisonflashbg 1.8s ease-out forwards",
+      }}
+    >
+      <div
+        style={{
+          position: "absolute",
+          inset: 0,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+      >
+        <div
+          style={{
+            fontSize: 72,
+            fontWeight: "bold",
+            letterSpacing: 16,
+            color: "#fff7d6",
+            textShadow: "0 0 30px #ffcc33, 0 0 80px #ff9900",
+            animation: "unisonzoom 1.8s ease-out forwards",
+          }}
+        >
+          UNISON!
+        </div>
+      </div>
+      <style>{`@keyframes unisonflashbg { 0% { opacity: 0; background: radial-gradient(ellipse at center, #ffcc3344 0%, transparent 70%); } 12% { opacity: 1; } 100% { opacity: 0; } } @keyframes unisonzoom { 0% { opacity: 0; transform: scale(1.4); } 12% { opacity: 1; transform: scale(1); } 75% { opacity: 1; } 100% { opacity: 0; transform: scale(0.97); } }`}</style>
+    </div>
+  );
+}
+
+function DiveScreen({ sessionId }: { sessionId: Id<"sessions"> }) {  const snapshot = useQuery(api.session.snapshot, { sessionId });
   const [followCam, setFollowCam] = useState(true);
 
   if (snapshot && snapshot.status !== "active") {
@@ -511,6 +568,7 @@ function DiveScreen({ sessionId }: { sessionId: Id<"sessions"> }) {
       <div style={{ flex: 3, position: "relative" }}>
         <DiveView sessionId={sessionId} followCam={followCam} />
         <WaveBanner events={(snapshot?.events ?? []) as BrainEvent[]} />
+        <UnisonBanner events={(snapshot?.events ?? []) as BrainEvent[]} />
       </div>
       <div style={{ flex: 1, borderLeft: "1px solid #1a3a5c", minWidth: 300 }}>
         <Hud

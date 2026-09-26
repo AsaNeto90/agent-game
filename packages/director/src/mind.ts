@@ -23,6 +23,8 @@ export interface MindContext {
   scriptsReady?: string[];
   /** The operator said "use something" — cast the best ready script for the situation. */
   scriptRequested?: boolean;
+  /** Current synchro value — the mind needs it to time the unison finisher. */
+  synchro?: number;
 }
 
 export interface MindDecision {
@@ -36,7 +38,10 @@ export interface MindDecision {
     | "dodge"
     | "jump"
     | "orbit"
-    | "strafe";
+    | "strafe"
+    /** The unison finisher — the synchro payoff. The loop enforces the 80
+     *  gate and one-use-per-dive; the mind just picks the moment. */
+    | "unison";
   /** Persistent stance the mind adopts for itself — the loop ignores it
    *  while the operator holds the style lock. */
   style?: "evasive" | "balanced";
@@ -145,6 +150,21 @@ export class MockMind implements MindProvider {
     // Hurt -> disengage and go evasive on your own. No keyword required.
     if (agentHp < 35) {
       return withScript({ action: "disengage", style: "evasive", rationale: "hurt — going evasive" });
+    }
+    // The unison: when the meter's hot and something big is on the scope,
+    // cash it in. The loop enforces the 80 gate and one-use-per-dive; the
+    // 85 bar here keeps a margin so it lands while still in sync.
+    const syn = ctx.synchro ?? 0;
+    if (syn >= 85) {
+      const threats = [
+        ...t.matchAll(/(\w+?)(\d+)(?:\((\w+)\))?(?:→(\w+))? (melee|mid|long|far)( WINDUP| SWING!)?/g),
+      ];
+      const big = threats.some(
+        (m) => (m[3] ?? "scrapbit") === "bulwark" || parseInt(m[2], 10) >= 60,
+      );
+      if (big) {
+        return withScript({ action: "unison", rationale: "unison — deleting the big one" });
+      }
     }
     // A swing about to land in melee -> leap it.
     if (swings > 0 && /agent \d+% melee/.test(t)) {

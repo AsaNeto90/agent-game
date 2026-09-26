@@ -120,6 +120,59 @@ export function synchroTier(synchro: number): {
 }
 
 /**
+ * The unison finisher — the synchro meter's payoff move. A heavy strike on
+ * the agent's current focus target, one use per dive, gated at 80 synchro
+ * (in-sync tier). The bond is the damage: higher tiers hit dramatically
+ * harder, so the relationship literally powers the finisher.
+ */
+/** Minimum synchro to fire the unison — the in-sync tier. */
+export const UNISON_MIN_SYNCHRO = 80;
+/** Synchro is set to this after firing — a real commitment, not a free nuke. */
+export const UNISON_SYCHRO_AFTER = 40;
+const UNISON_BASE_POWER = 60;
+/** Bond tier -> unison damage multiplier. The relationship is the damage. */
+const UNISON_BOND_MULT: Record<string, number> = {
+  spark: 1,
+  ember: 1.1,
+  blaze: 1.25,
+  inferno: 1.5,
+  soulbound: 1.8,
+};
+
+export function unisonDamage(synchro: number, bondTier: string): number {
+  const syncScale = 1 + Math.max(0, synchro - UNISON_MIN_SYNCHRO) / 200;
+  return Math.round(UNISON_BASE_POWER * syncScale * (UNISON_BOND_MULT[bondTier] ?? 1));
+}
+
+/**
+ * Fire the unison: the agent's heaviest strike, on its current focus target
+ * (nearest virus, honoring targetElement like the L0 pick — viruses only,
+ * never the site). Flows through strike() so hit/down events hit the feed.
+ * Returns damage dealt and the target's name, or null when there's nothing
+ * to hit.
+ */
+export function fireUnison(
+  state: WorldState,
+  synchro: number,
+  bondTier: string,
+  targetElement?: Element | null,
+): { damage: number; targetName: string } | null {
+  const agent = state.fighters.find((f) => f.kind === "agent" && f.hp > 0);
+  const viruses = state.fighters.filter((f) => f.kind === "virus" && f.hp > 0);
+  if (!agent || viruses.length === 0) return null;
+  const pool =
+    targetElement && viruses.some((v) => v.element === targetElement)
+      ? viruses.filter((v) => v.element === targetElement)
+      : viruses;
+  const target = pool.reduce((a, b) => (dist(agent.pos, a.pos) <= dist(agent.pos, b.pos) ? a : b));
+  const raw = unisonDamage(synchro, bondTier) * elementMultiplier(agent.element, target.element);
+  agent.pose = "cast";
+  strike(state, agent, target, raw);
+  const dealt = Math.max(1, Math.round(raw));
+  return { damage: dealt, targetName: target.name };
+}
+
+/**
  * One L0 tick. The agent acts on `directive` ("engage" | "disengage" | ...);
  * viruses run a tiny aggression loop. Mutates state in place, appends events.
  */

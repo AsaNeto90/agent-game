@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { elementMultiplier, rangeBandOf } from "@agent-game/shared";
-import { applyScript, rng, spawnStructures, spawnWave, synchroTier, tickWorld, waveComposition, STRUCTURE_MAX_HP, type Fighter, type WorldState } from "./world.js";
+import { applyScript, fireUnison, rng, spawnStructures, spawnWave, synchroTier, tickWorld, unisonDamage, waveComposition, STRUCTURE_MAX_HP, UNISON_MIN_SYNCHRO, UNISON_SYCHRO_AFTER, type Fighter, type WorldState } from "./world.js";
 
 describe("element matchups", () => {
   it("fire beats wood, wood resists fire", () => {
@@ -851,5 +851,121 @@ describe("site defense — viruses want the website, not the agent", () => {
     const agent = w.fighters[0];
     tickWorld(w, 0.25, "protect", rng(3));
     expect(agent.pos.x).toBeGreaterThan(0); // moved toward the eater at +x
+  });
+});
+
+describe("unison finisher", () => {
+  const mkDuel = (): WorldState => ({
+    fighters: [
+      {
+        id: "a",
+        kind: "agent",
+        name: "AstroMan.PY",
+        pos: { x: 0, y: 0, z: 0 },
+        pose: "idle",
+        hp: 120,
+        maxHp: 120,
+        element: "null",
+        cooldown: 0,
+      },
+      {
+        id: "v1",
+        kind: "virus",
+        name: "Scrapbit",
+        pos: { x: 1, y: 0, z: 0 },
+        pose: "idle",
+        hp: 50,
+        maxHp: 50,
+        element: "null",
+        cooldown: 0,
+      },
+      {
+        id: "v2",
+        kind: "virus",
+        name: "Bulwark",
+        species: "bulwark",
+        pos: { x: 10, y: 0, z: 0 },
+        pose: "idle",
+        hp: 176,
+        maxHp: 176,
+        element: "null",
+        cooldown: 0,
+      },
+    ],
+    structures: [
+      { id: "site-homepage", name: "Homepage", pos: { x: 11, y: 0, z: 0 }, hp: 100, maxHp: 120 },
+    ],
+    events: [],
+  });
+
+  it("damage scales with synchro and bond tier", () => {
+    expect(unisonDamage(80, "spark")).toBe(60);
+    expect(unisonDamage(100, "spark")).toBe(66); // +10% at a full meter
+    expect(unisonDamage(80, "inferno")).toBe(90); // bond is the damage
+    expect(unisonDamage(95, "blaze")).toBe(81); // 60 * 1.075 * 1.25 = 80.625
+    expect(UNISON_MIN_SYNCHRO).toBe(80);
+    expect(UNISON_SYCHRO_AFTER).toBe(40);
+  });
+
+  it("one-shots a same-wave virus, chunks a bulwark", () => {
+    const w = mkDuel();
+    const res = fireUnison(w, 80, "spark");
+    expect(res).not.toBeNull();
+    expect(res!.damage).toBe(60);
+    const v1 = w.fighters.find((f) => f.id === "v1")!;
+    expect(v1.hp).toBe(0);
+    expect(w.events).toContainEqual(expect.objectContaining({ type: "down", fighterId: "v1" }));
+    const v2 = w.fighters.find((f) => f.id === "v2")!;
+    expect(v2.hp).toBe(176); // untouched — the finisher hits one target
+  });
+
+  it("chunks a bulwark instead of deleting it", () => {
+    const w = mkDuel();
+    w.fighters.find((f) => f.id === "v1")!.hp = 0; // only the bulwark stands
+    const res = fireUnison(w, 100, "blaze");
+    expect(res!.targetName).toBe("Bulwark");
+    const v2 = w.fighters.find((f) => f.id === "v2")!;
+    // 60 * 1.1 * 1.25 = 82.5 -> 83 damage on 176hp: a chunk, not a kill
+    expect(v2.hp).toBe(176 - 83);
+    expect(v2.hp).toBeGreaterThan(0);
+  });
+
+  it("never touches the site — viruses only", () => {
+    const w = mkDuel();
+    const siteHp = w.structures![0].hp;
+    fireUnison(w, 80, "spark");
+    expect(w.structures![0].hp).toBe(siteHp);
+    const hits = w.events.filter((e) => e.type === "hit");
+    expect(hits.every((e) => e.type === "hit" && e.targetId.startsWith("v"))).toBe(true);
+  });
+
+  it("honors targetElement like the L0 pick", () => {
+    const w = mkDuel();
+    w.fighters.find((f) => f.id === "v1")!.element = "aqua";
+    w.fighters.find((f) => f.id === "v2")!.element = "fire";
+    const res = fireUnison(w, 80, "spark", "fire");
+    expect(res!.targetName).toBe("Bulwark"); // farther, but the called element
+  });
+
+  it("returns null when there's nothing to hit", () => {
+    const w = mkDuel();
+    w.fighters = w.fighters.filter((f) => f.kind === "agent");
+    expect(fireUnison(w, 100, "soulbound")).toBeNull();
+    expect(w.events).toHaveLength(0);
+  });
+
+  it("puts the agent in the cast pose", () => {
+    const w = mkDuel();
+    fireUnison(w, 80, "spark");
+    expect(w.fighters.find((f) => f.id === "a")!.pose).toBe("cast");
+  });
+
+  it("applies the element wheel", () => {
+    const w = mkDuel();
+    const agent = w.fighters.find((f) => f.id === "a")!;
+    agent.element = "fire"; // fire > wood, but v1 is null — neutral
+    w.fighters.find((f) => f.id === "v1")!.element = "wood";
+    const res = fireUnison(w, 80, "spark");
+    expect(res!.damage).toBe(120); // 60 x 2
   });
 });

@@ -34,6 +34,7 @@ const ACTIONS = [
   "jump",
   "orbit",
   "strafe",
+  "unison",
 ] as const;
 
 export interface VendorMindOptions {
@@ -99,7 +100,7 @@ export class VendorMind implements MindProvider {
       `You are the combat instincts of ${ctx.agentName}.${ctx.agentExt}, a battle companion program fighting rogue viruses in cyberspace while a human operator coaches in real time.`,
       this.memoryBlock(ctx),
       `Read the situation and pick ONE action. Reply with ONLY a JSON object, no other text:`,
-      `{"action": "<one of engage|disengage|hold|focus_weakest|protect|dodge|jump|orbit|strafe>", "style": "<evasive|balanced|null>", "rationale": "<under 12 words>", "script": "<optional script id, or omit>"}`,
+      `{"action": "<one of engage|disengage|hold|focus_weakest|protect|dodge|jump|orbit|strafe|unison>", "style": "<evasive|balanced|null>", "rationale": "<under 12 words>", "script": "<optional script id, or omit>"}`,
       `- engage: close to melee and fight the nearest threat`,
       `- disengage: fall back and create distance (use when hurt or outnumbered)`,
       `- hold: stay put, wait for the operator's call`,
@@ -109,6 +110,7 @@ export class VendorMind implements MindProvider {
       `- jump: leap — dodges a melee swing about to land (marked SWING! in the situation)`,
       `- orbit: circle around the nearest virus for a few seconds, holding distance (use when the operator asks to pivot/circle them, or to reposition without retreating)`,
       `- strafe: quick lateral dash — sidesteps a telegraphed swing without giving ground`,
+      `- unison: THE finisher — only when your synchro reads 80+. A massive strike on your current focus target (viruses only, never the site), then synchro drops to 40 and it cannot fire again this dive. Call it when a high-hp threat (a bulwark, or any virus at 60+hp) is on the scope and synchro is 85+ — the operator can also call it with "unison!". Your synchro is passed with the situation; treat 85+ as the green light.`,
       `- style: your persistent stance. "evasive" makes you favor dodging and jumping on your own; "balanced" fights straightforward; null leaves it unchanged. Go evasive yourself when hurt — don't wait to be told.`,
       `- script: OPTIONAL — fire one of your own kit scripts alongside the action. Your kit: mend-protocol (heal 25 — use when your hp is under 40%), aegis-wall (barrier 30 — use when a bulwark is winding up), static-snare (stun — use when 3+ viruses), arc-lance (mid-range damage — finish a virus under 20hp), cinder-slash (heavy melee damage — use when the operator says "use something"). Only include it when the moment is right; most ticks, omit it. Never invent other ids.`,
       `The operator's recent words are given with the situation — honor casual requests ("be careful", "go aggressive") even when they don't match a command word.`,
@@ -186,6 +188,7 @@ export class VendorMind implements MindProvider {
     const lines = (ctx.operatorLines ?? []).map((l) => l.trim()).filter(Boolean);
     const user = [
       `Situation: ${ctx.tactics ?? ctx.situation}`,
+      `Synchro: ${ctx.synchro ?? 50} (the unison finisher unlocks at 80)`,
       lines.length > 0
         ? `Operator's recent words: ${lines.map((l) => `"${l}"`).join(" ")}`
         : `Operator's recent words: none`,

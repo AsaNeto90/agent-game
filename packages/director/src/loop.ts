@@ -8,6 +8,7 @@ import type { Id } from "../../../convex/_generated/dataModel.js";
 import { MockMind, AGENT_KIT, estimateCostUsd, type MindDecision, type MindProvider } from "./mind.js";
 import {
   applyScript,
+  fireUnison,
   rng,
   spawnWave,
   spawnStructures,
@@ -15,6 +16,8 @@ import {
   STRUCTURE_REGEN,
   synchroTier,
   tickWorld,
+  UNISON_MIN_SYNCHRO,
+  UNISON_SYCHRO_AFTER,
   type Fighter,
   type FightStyle,
   type WorldState,
@@ -228,6 +231,7 @@ const MIND_ACTION_VERBS: Record<string, string> = {
   hold: "held position",
   focus_weakest: "focused the weakest",
   protect: "stood guard over the site",
+  unison: "called the unison",
   dodge: "dashed clear",
   jump: "leapt swings",
   orbit: "pivoted around them",
@@ -335,6 +339,20 @@ export function tacticalSituation(world: WorldState, wave: number): string {
   return `w${wave} | ${viruses.length}v: ${parts.join(", ")} | agent ${agentHp}% ${nearest} | site: ${site} | style ${world.style ?? "balanced"}`;
 }
 
+/**
+ * The unison gate — pure so tests can drive it. One use per dive, and the
+ * meter has to be hot (in-sync tier). The loop enforces this for operator
+ * calls and mind calls alike.
+ */
+export function unisonGate(
+  synchro: number,
+  unisonUsed: boolean,
+): "ok" | "not_in_sync" | "already_used" {
+  if (unisonUsed) return "already_used";
+  if (synchro < UNISON_MIN_SYNCHRO) return "not_in_sync";
+  return "ok";
+}
+
 /** How the mind's decisions reach the sim — same primitives the operator uses. */
 export interface MindActuators {
   /** Enqueue a one-shot impulse (dodge/jump). */
@@ -397,6 +415,10 @@ export function applyMindDecision(
     } else {
       done.push("strafe(skipped: operator moving)");
     }
+  } else if (a === "unison") {
+    // The finisher isn't a stance — the loop fires it (with the gate), this
+    // just logs the intent so the flight recorder sees it.
+    done.push("unison");
   } else {
     act.maneuver(a, tick + MIND_MANEUVER_TICKS);
     done.push(`maneuver:${a}`);
@@ -533,6 +555,9 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
   let directiveSource: "operator" | "mind" | null = null; // whose judgment currently steers
   let styleByOperator = false; // the operator's word on style is law — the mind won't touch it
   let decideInFlight = false; // one decide() at a time — a slow vendor must not pile up
+  // The unison finisher: one use per dive, gated at 80 synchro. Firing it
+  // drops synchro to 40 — the operator (or the mind) spends the meter.
+  let unisonUsed = false;
   // The agent's own script brain: per-script cooldowns (tick when ready again),
   // when the operator last slotted one (the agent holds its fire for 10s after —
   // their cast wins), and whether they said "use something!".
@@ -642,6 +667,61 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
     });
   };
 
+  /**
+   * Fire the unison finisher — shared by the operator's "unison!" command
+   * and the mind's own call. Gate: 80+ synchro, one use per dive. Firing
+   * drops synchro to 40 — a real commitment, not a free nuke. The flight
+   * recorder gets every outcome, including rejections.
+   */
+  const tryUnison = async (source: "operator" | "mind", t0: number): Promise<void> => {
+    const tag = `${agent.name}.${agent.ext}`;
+    const gate = unisonGate(synchro, unisonUsed);
+    const refuse = async (text: string, reason: string) => {
+      await convex.mutation(api.session.pushEvent, {
+        sessionId,
+        tick,
+        event: { type: "dialogue", speaker: tag, text },
+      });
+      await trace("L1", "unison_rejected", `${source}: ${reason}`, Date.now() - t0);
+    };
+    if (gate === "already_used") {
+      await refuse(
+        `My unison's spent for this dive, operator — one shot was all I had.`,
+        "already used",
+      );
+      return;
+    }
+    if (gate === "not_in_sync") {
+      await refuse(
+        `I can't — we're not in sync. Coach me to ${UNISON_MIN_SYNCHRO} first.`,
+        "synchro too low",
+      );
+      return;
+    }
+    const res = fireUnison(world, synchro, agent.bondTier, targetElement);
+    if (!res) {
+      await refuse(`Nothing to hit — save the unison for a real target.`, "no target");
+      return;
+    }
+    unisonUsed = true;
+    synchro = UNISON_SYCHRO_AFTER;
+    await convex.mutation(api.session.pushEvent, {
+      sessionId,
+      tick,
+      event: {
+        type: "dialogue",
+        speaker: tag,
+        text: `UNISON! — ${res.damage} on ${res.targetName}.`,
+      },
+    });
+    await trace(
+      "L1",
+      "unison",
+      `${source} fired the unison: ${res.damage} on ${res.targetName}; synchro -> ${UNISON_SYCHRO_AFTER}`,
+      Date.now() - t0,
+    );
+  };
+
   await trace("L2", "dive_start", `${agent.name}.${agent.ext} dove into ${cfg.zoneId}`, 0);
   if (isNewSession) {
     await convex.mutation(api.session.pushEvent, {
@@ -694,6 +774,23 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
           text.toLowerCase(),
         );
         if (wantsScript) scriptRequested = true;
+        // The unison finisher — the synchro payoff. Intercepts before
+        // ordinary parsing: "unison!" is a moment, not a maneuver.
+        if (/unison/i.test(text)) {
+          if (!resting) waveCommands++; // coaching that shaped this wave — the debrief counts it
+          waveMindActions.add("unison"); // the debrief remembers the moment
+          lastOperatorTick = tick;
+          noteOperatorLine(text);
+          if (text.trim()) {
+            await convex.mutation(api.session.pushEvent, {
+              sessionId,
+              tick,
+              event: { type: "dialogue", speaker: "OPERATOR", text },
+            });
+          }
+          await tryUnison("operator", t0);
+          continue;
+        }
         // "Next wave" starts the fight again — only meaningful while resting.
         if (resting && isReadyCommand(text)) {
           resting = false;
@@ -1073,6 +1170,7 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
           recentMemories: memoryLines,
           situation,
           tactics,
+          synchro, // the mind needs the meter to time the unison
           scriptsReady: readyIds,
           scriptRequested: wantedScript,
           operatorLines: recentOperatorLines
@@ -1101,6 +1199,12 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
             },
             { styleLocked: styleByOperator, queueBusy: moveQueue.length > 0 },
           );
+          // The unison is a moment, not a stance — applyMindDecision only
+          // logs it; the loop fires it through the same gate as the
+          // operator's call (80+ synchro, one use per dive).
+          if (d.action === "unison") {
+            await tryUnison("mind", t0d);
+          }
           // The agent's own script brain: it picked the moment, the loop
           // enforces cooldowns and operator priority. The operator's word is
           // law — no self-casting for 10s after they slotted one themselves.

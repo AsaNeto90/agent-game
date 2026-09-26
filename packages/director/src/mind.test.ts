@@ -289,3 +289,68 @@ describe("pickScript reads objective arrows", () => {
     expect(s?.scriptId).toBe("aegis-wall");
   });
 });
+
+describe("MockMind calls the unison finisher", () => {
+  const mind = new MockMind();
+  const tctx = (tactics: string, synchro: number): MindContext => ({
+    agentName: "AstroMan",
+    agentExt: "PY",
+    bondTier: "spark",
+    recentMemories: [],
+    situation: "fighting",
+    tactics,
+    synchro,
+  });
+  const pack =
+    "w2 | 2v: wood176(bulwark)→Database melee, aqua40(spitter)→Database mid | agent 70% melee | site: Homepage 80%, Database 100%, Gateway 45% | style balanced";
+  const fry =
+    "w1 | 2v: aqua40(scrapbit)→Homepage mid, elec32(dasher)→Database far | agent 90% mid | site: Homepage 100%, Database 100%, Gateway 100% | style balanced";
+
+  it("calls unison at 85+ synchro when a bulwark is on the scope", async () => {
+    const d = await mind.decide(tctx(pack, 90));
+    expect(d.action).toBe("unison");
+    expect(d.rationale).toMatch(/unison/i);
+  });
+
+  it("calls unison for any virus at 60+hp, not just bulwarks", async () => {
+    const d = await mind.decide(
+      tctx(
+        "w3 | 1v: aqua70(spitter)→Database mid | agent 80% mid | site: Homepage 90% | style balanced",
+        85,
+      ),
+    );
+    expect(d.action).toBe("unison");
+  });
+
+  it("holds its fire below 85 — the gate needs a margin", async () => {
+    const d = await mind.decide(tctx(pack, 84));
+    expect(d.action).not.toBe("unison");
+  });
+
+  it("does not waste the unison on small fry", async () => {
+    const d = await mind.decide(tctx(fry, 95));
+    expect(d.action).not.toBe("unison");
+  });
+
+  it("survival beats the finisher — hurt means disengage, not unison", async () => {
+    const d = await mind.decide(
+      tctx(
+        "w2 | 1v: wood176(bulwark)→Agent melee | agent 20% melee | site: Homepage 80% | style balanced",
+        95,
+      ),
+    );
+    expect(d.action).toBe("disengage");
+  });
+
+  it("without a synchro reading, never calls unison", async () => {
+    const d = await mind.decide({
+      agentName: "AstroMan",
+      agentExt: "PY",
+      bondTier: "spark",
+      recentMemories: [],
+      situation: "fighting",
+      tactics: pack,
+    });
+    expect(d.action).not.toBe("unison");
+  });
+});
