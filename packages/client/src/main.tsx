@@ -16,6 +16,14 @@ const ELEMENT_COLORS: Record<string, number> = {
   null: 0x8899aa,
 };
 
+// Virus species read at a glance — keyed off the name the director assigns,
+// so no schema changes were needed to tell them apart.
+const SPECIES_COLORS: Record<string, number> = {
+  Dasher: 0xff4455, // fast — red
+  Spitter: 0x33ffcc, // ranged — teal
+  Bulwark: 0xdd9933, // tank — bronze
+};
+
 /**
  * DiveView — the 3D UX layer. It renders; it never thinks.
  * Subscribes to the Convex snapshot (4Hz semantic state) and interpolates
@@ -59,11 +67,20 @@ function DiveView({ sessionId, followCam }: { sessionId: Id<"sessions">; followC
       for (const [, mesh] of meshes.current) {
         const target = (mesh.userData.target as THREE.Vector3 | undefined);
         if (target) mesh.position.lerp(target, 0.18);
-        // Pose flavor: bob while running, flash on hit.
-        if (mesh.userData.pose === "hit") {
-          (mesh.material as THREE.MeshStandardMaterial).emissive.setHex(0xff2222);
+        // Pose flavor: bob while running, flash on hit — and the wind-up
+        // telegraph: a winding-up virus pulses hot orange. That's the
+        // operator's cue to kite, jump, or strafe before the swing lands.
+        const mat = mesh.material as THREE.MeshStandardMaterial;
+        const pose = mesh.userData.pose as string | undefined;
+        if (pose === "hit") {
+          mat.emissive.setHex(0xff2222);
+          mat.emissiveIntensity = 1;
+        } else if (pose === "windup") {
+          mat.emissive.setHex(0xff6a00);
+          mat.emissiveIntensity = 0.55 + 0.45 * Math.sin(performance.now() / 90);
         } else {
-          (mesh.material as THREE.MeshStandardMaterial).emissive.setHex(0x000000);
+          mat.emissive.setHex(0x000000);
+          mat.emissiveIntensity = 1;
         }
       }
       // Follow cam: hover over the agent, looking down at it.
@@ -116,12 +133,28 @@ function DiveView({ sessionId, followCam }: { sessionId: Id<"sessions">; followC
         mesh = new THREE.Mesh(
           geo,
           new THREE.MeshStandardMaterial({
-            color: ELEMENT_COLORS[e.element] ?? 0x8899aa,
+            color:
+              e.kind === "virus"
+                ? (SPECIES_COLORS[e.name] ?? ELEMENT_COLORS[e.element] ?? 0x8899aa)
+                : (ELEMENT_COLORS[e.element] ?? 0x8899aa),
             roughness: 0.35,
             metalness: 0.6,
           }),
         );
         mesh.position.set(e.position.x, 1 + e.position.y, e.position.z);
+        // Floating HP bar — a sprite that always faces the camera. Redrawn
+        // only when the hp fraction actually changes, so it costs nothing
+        // at rest.
+        const barCanvas = document.createElement("canvas");
+        barCanvas.width = 64;
+        barCanvas.height = 8;
+        const barTex = new THREE.CanvasTexture(barCanvas);
+        const barMat = new THREE.SpriteMaterial({ map: barTex, depthTest: false });
+        const bar = new THREE.Sprite(barMat);
+        bar.scale.set(1.7, 0.21, 1);
+        bar.position.y = 1.7;
+        mesh.add(bar);
+        mesh.userData.bar = { canvas: barCanvas, tex: barTex, mat: barMat, last: -1 };
         scene.add(mesh);
         meshes.current.set(e.id, mesh);
       }
@@ -130,9 +163,27 @@ function DiveView({ sessionId, followCam }: { sessionId: Id<"sessions">; followC
       mesh.userData.kind = e.kind;
       const s = e.hp / e.maxHp;
       mesh.scale.setScalar(0.6 + 0.4 * Math.max(0.05, s));
+      const barState = mesh.userData.bar as
+        | { canvas: HTMLCanvasElement; tex: THREE.CanvasTexture; last: number }
+        | undefined;
+      if (barState && Math.abs(s - barState.last) > 0.001) {
+        barState.last = s;
+        const ctx = barState.canvas.getContext("2d")!;
+        ctx.clearRect(0, 0, 64, 8);
+        ctx.fillStyle = "rgba(2,6,16,0.6)";
+        ctx.fillRect(0, 0, 64, 8);
+        ctx.fillStyle = s > 0.5 ? "#3dff7a" : s > 0.25 ? "#ffd23d" : "#ff4444";
+        ctx.fillRect(1, 1, 62 * Math.max(0, s), 6);
+        barState.tex.needsUpdate = true;
+      }
     }
     for (const [id, mesh] of meshes.current) {
       if (!seen.has(id)) {
+        const barState = mesh.userData.bar as
+          | { tex: THREE.CanvasTexture; mat: THREE.SpriteMaterial }
+          | undefined;
+        barState?.tex.dispose();
+        barState?.mat.dispose();
         scene.remove(mesh);
         meshes.current.delete(id);
       }
@@ -362,6 +413,59 @@ function DiveConsole({ diveId, onReset }: { diveId: string; onReset: () => void 
   return <DiveScreen key={result.sessionId} sessionId={result.sessionId} />;
 }
 
+/** Wave banner — a big cinematic title card when a wave starts or clears.
+ * Keys off the wave dialogue events, so no backend changes were needed. */
+function WaveBanner({ events }: { events: BrainEvent[] }) {
+  const [banner, setBanner] = useState<string | null>(null);
+  const lastKey = useRef<string | null>(null);
+  useEffect(() => {
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i];
+      if (e.type !== "dialogue" || typeof e.text !== "string") continue;
+      const start = /wave (\d+) incoming/i.exec(e.text);
+      const clear = /wave (\d+) cleared/i.exec(e.text);
+      const m = start ?? clear;
+      if (m) {
+        const key = `${m[1]}:${start ? "start" : "clear"}:${i}`;
+        if (lastKey.current !== key) {
+          lastKey.current = key;
+          setBanner(start ? `WAVE ${m[1]}` : `WAVE ${m[1]} CLEARED`);
+          const t = setTimeout(() => setBanner(null), 2600);
+          return () => clearTimeout(t);
+        }
+        break;
+      }
+    }
+  }, [events]);
+  if (!banner) return null;
+  return (
+    <div
+      style={{
+        position: "absolute",
+        inset: 0,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        pointerEvents: "none",
+      }}
+    >
+      <div
+        style={{
+          fontSize: 64,
+          fontWeight: "bold",
+          letterSpacing: 12,
+          color: "#cfe3ff",
+          textShadow: "0 0 24px #3399ff, 0 0 60px #3399ff88",
+          animation: "wavebanner 2.6s ease-out forwards",
+        }}
+      >
+        {banner}
+      </div>
+      <style>{`@keyframes wavebanner { 0% { opacity: 0; transform: scale(1.25); } 12% { opacity: 1; transform: scale(1); } 75% { opacity: 1; } 100% { opacity: 0; transform: scale(0.98); } }`}</style>
+    </div>
+  );
+}
+
 function DiveScreen({ sessionId }: { sessionId: Id<"sessions"> }) {
   const snapshot = useQuery(api.session.snapshot, { sessionId });
   const [followCam, setFollowCam] = useState(true);
@@ -389,8 +493,9 @@ function DiveScreen({ sessionId }: { sessionId: Id<"sessions"> }) {
         fontFamily: "monospace",
       }}
     >
-      <div style={{ flex: 3 }}>
+      <div style={{ flex: 3, position: "relative" }}>
         <DiveView sessionId={sessionId} followCam={followCam} />
+        <WaveBanner events={(snapshot?.events ?? []) as BrainEvent[]} />
       </div>
       <div style={{ flex: 1, borderLeft: "1px solid #1a3a5c", minWidth: 300 }}>
         <Hud

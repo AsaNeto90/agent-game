@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { elementMultiplier, rangeBandOf } from "@agent-game/shared";
-import { applyScript, rng, spawnWave, tickWorld, type Fighter, type WorldState } from "./world.js";
+import { applyScript, rng, spawnWave, synchroTier, tickWorld, waveComposition, type Fighter, type WorldState } from "./world.js";
 
 describe("element matchups", () => {
   it("fire beats wood, wood resists fire", () => {
@@ -509,3 +509,215 @@ describe("orbit nudge", () => {
     expect(fast.fighters[0].pos.z).toBeGreaterThan(slow.fighters[0].pos.z);
   });
 });
+
+describe("synchro tiers", () => {
+  const mkDuel = (): WorldState => ({
+    fighters: [
+      {
+        id: "a",
+        kind: "agent",
+        name: "Test.PY",
+        pos: { x: 0, y: 0, z: 0 },
+        pose: "idle",
+        hp: 100,
+        maxHp: 100,
+        element: "null",
+        cooldown: 0,
+      },
+      {
+        id: "v",
+        kind: "virus",
+        name: "Scrapbit",
+        pos: { x: 1, y: 0, z: 0 }, // melee band
+        pose: "idle",
+        hp: 100,
+        maxHp: 100,
+        element: "null",
+        cooldown: 99, // virus sits out — we only measure the agent's swing
+        aggression: 0,
+      },
+    ],
+    events: [],
+  });
+
+  it("tier boundaries", () => {
+    expect(synchroTier(100).tier).toBe("in sync");
+    expect(synchroTier(80).tier).toBe("in sync");
+    expect(synchroTier(79).tier).toBe("steady");
+    expect(synchroTier(50).tier).toBe("steady");
+    expect(synchroTier(30).tier).toBe("steady");
+    expect(synchroTier(29).tier).toBe("desync");
+    expect(synchroTier(0).tier).toBe("desync");
+  });
+
+  it("in sync hits harder than steady, desync hits softer", () => {
+    const hi = mkDuel();
+    const mid = mkDuel();
+    const lo = mkDuel();
+    tickWorld(hi, 0.25, "engage", rng(7), null, null, 100);
+    tickWorld(mid, 0.25, "engage", rng(7), null, null, 50);
+    tickWorld(lo, 0.25, "engage", rng(7), null, null, 0);
+    const dmg = (w: WorldState) => 100 - w.fighters.find((f) => f.id === "v")!.hp;
+    expect(dmg(hi)).toBeGreaterThan(dmg(mid));
+    expect(dmg(lo)).toBeLessThan(dmg(mid));
+    expect(dmg(hi)).toBe(Math.round(10 * 1.25)); // exact: 10 x 1.25
+  });
+
+  it("in sync cycles the Pulse Arm faster", () => {
+    const hi = mkDuel();
+    const mid = mkDuel();
+    tickWorld(hi, 0.25, "engage", rng(7), null, null, 100);
+    tickWorld(mid, 0.25, "engage", rng(7), null, null, 50);
+    expect(hi.fighters[0].cooldown).toBeCloseTo(1.2 * 0.8, 5);
+    expect(mid.fighters[0].cooldown).toBeCloseTo(1.2, 5);
+  });
+
+  it("viruses get no synchro bonus — the bond is the operator's edge", () => {
+    const mkAmbush = (): WorldState => {
+      const w = mkDuel();
+      const v = w.fighters.find((f) => f.id === "v")!;
+      v.windup = 0.1; // about to land
+      v.cooldown = 0;
+      return w;
+    };
+    const hi = mkAmbush();
+    const mid = mkAmbush();
+    tickWorld(hi, 0.25, "hold", rng(7), null, null, 100);
+    tickWorld(mid, 0.25, "hold", rng(7), null, null, 50);
+    const dmg = (w: WorldState) => 100 - w.fighters.find((f) => f.id === "a")!.hp;
+    expect(dmg(hi)).toBe(dmg(mid));
+  });
+
+  it("defaults to steady when synchro is omitted", () => {
+    const w = mkDuel();
+    tickWorld(w, 0.25, "engage", rng(7));
+    const virus = w.fighters.find((f) => f.id === "v")!;
+    expect(100 - virus.hp).toBe(10);
+  });
+});
+
+describe("virus species", () => {
+  const mkAgent = (): WorldState => ({
+    fighters: [
+      {
+        id: "a",
+        kind: "agent",
+        name: "Test.PY",
+        pos: { x: 0, y: 0, z: 0 },
+        pose: "idle",
+        hp: 120,
+        maxHp: 120,
+        element: "null",
+        cooldown: 0,
+      },
+    ],
+    events: [],
+  });
+  const mkVirus = (species: string, x: number): Fighter => ({
+    id: `v-${species}`,
+    kind: "virus",
+    species,
+    name: species,
+    pos: { x, y: 0, z: 0 },
+    pose: "idle",
+    hp: 60,
+    maxHp: 60,
+    element: "null",
+    cooldown: 0,
+    aggression: 1,
+  });
+
+  it("waveComposition escalates deterministically", () => {
+    expect(waveComposition(1)).toEqual(["scrapbit", "scrapbit"]);
+    expect(waveComposition(2)).toEqual(["scrapbit", "scrapbit", "dasher"]);
+    expect(waveComposition(3)).toContain("spitter");
+    expect(waveComposition(4)).toContain("bulwark");
+    expect(waveComposition(9)).toHaveLength(6); // capped
+  });
+
+  it("spawnWave assigns species kits with scaled hp", () => {
+    const w = mkAgent();
+    spawnWave(w, 4, rng(1));
+    const by = new Map(
+      w.fighters.filter((f) => f.kind === "virus").map((f) => [f.species!, f]),
+    );
+    expect(by.get("bulwark")!.maxHp).toBe(Math.round(80 * 2.2));
+    expect(by.get("dasher")!.maxHp).toBe(Math.round(80 * 0.8));
+    expect(by.get("scrapbit")!.maxHp).toBe(80);
+    expect(by.get("bulwark")!.name).toBe("Bulwark");
+  });
+
+  it("dasher closes distance faster than a scrapbit", () => {
+    const mk = (species: string) => {
+      const w = mkAgent();
+      w.fighters.push(mkVirus(species, 20));
+      return w;
+    };
+    const d = mk("dasher");
+    const s = mk("scrapbit");
+    for (let i = 0; i < 20; i++) {
+      tickWorld(d, 0.25, "hold", rng(3));
+      tickWorld(s, 0.25, "hold", rng(3));
+    }
+    const distD = Math.hypot(d.fighters[1].pos.x, d.fighters[1].pos.z);
+    const distS = Math.hypot(s.fighters[1].pos.x, s.fighters[1].pos.z);
+    expect(distD).toBeLessThan(distS);
+  });
+
+  it("spitter holds mid range and backs off when crowded", () => {
+    const w = mkAgent();
+    w.fighters.push(mkVirus("spitter", 1)); // starts in melee
+    for (let i = 0; i < 12; i++) tickWorld(w, 0.25, "hold", rng(3));
+    const d = Math.hypot(w.fighters[1].pos.x, w.fighters[1].pos.z);
+    expect(d).toBeGreaterThan(2.5); // backed out of melee
+    expect(d).toBeLessThan(8); // ...but holds mid, doesn't flee
+  });
+
+  it("spit can't be jumped — only leaving mid range dodges it", () => {
+    const w = mkAgent();
+    const v = mkVirus("spitter", 5); // mid range
+    v.windup = 0.1;
+    w.fighters.push(v);
+    w.fighters[0].airborne = 0.6; // mid-air — a melee swing would whiff
+    tickWorld(w, 0.25, "hold", rng(3));
+    expect(w.fighters[0].hp).toBeLessThan(120); // spit landed through the jump
+
+    const w2 = mkAgent();
+    const v2 = mkVirus("spitter", 5);
+    v2.windup = 0.1;
+    w2.fighters.push(v2);
+    w2.fighters[0].pos.x = 30; // fled to long range
+    tickWorld(w2, 0.25, "hold", rng(3));
+    expect(w2.fighters[0].hp).toBe(120); // whiffed
+  });
+
+  it("bulwark hits like a truck and telegraphs like a billboard", () => {
+    const w = mkAgent();
+    const v = mkVirus("bulwark", 1);
+    v.windup = 0.1;
+    w.fighters.push(v);
+    tickWorld(w, 0.25, "hold", rng(3));
+    expect(120 - w.fighters[0].hp).toBe(Math.round(6 * 1.7));
+
+    const wb = mkAgent();
+    const vb = mkVirus("bulwark", 1);
+    wb.fighters.push(vb);
+    const ws = mkAgent();
+    const vs = mkVirus("scrapbit", 1);
+    ws.fighters.push(vs);
+    tickWorld(wb, 0.25, "hold", rng(9));
+    tickWorld(ws, 0.25, "hold", rng(9));
+    expect(vb.windup!).toBeGreaterThan(vs.windup!); // longer telegraph
+  });
+
+  it("species-less viruses default to scrapbit behavior", () => {
+    const w = mkAgent();
+    const v = mkVirus("scrapbit", 1);
+    delete v.species;
+    v.windup = 0.1;
+    w.fighters.push(v);
+    tickWorld(w, 0.25, "hold", rng(3));
+    expect(120 - w.fighters[0].hp).toBe(6); // base VIRUS_POWER, no kit
+  });
+});
+

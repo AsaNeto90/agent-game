@@ -28,6 +28,8 @@ export interface Fighter {
   cooldown: number;
   /** viruses only: simple aggression 0..1 */
   aggression?: number;
+  /** virus species key — behavior kit; defaults to "scrapbit" */
+  species?: string;
   /** barrier hp from ward scripts — absorbs damage before hp */
   shield?: number;
   /**
@@ -75,6 +77,23 @@ const VIRUS_COOLDOWN = 2.4; // seconds between virus swings (plus wind-up)
 const MOVE_SPEED = 3.2; // m/s
 
 /**
+ * Synchro tiers — coaching quality made mechanical. High synchro means the
+ * operator and agent are reading each other: strikes hit harder and the
+ * Pulse Arm cycles faster. Low synchro is desync: the agent second-guesses,
+ * and hits land soft. Pure function, so the tiers are trivially testable.
+ */
+export type SynchroTier = "in sync" | "steady" | "desync";
+export function synchroTier(synchro: number): {
+  tier: SynchroTier;
+  damageMult: number;
+  cooldownMult: number;
+} {
+  if (synchro >= 80) return { tier: "in sync", damageMult: 1.25, cooldownMult: 0.8 };
+  if (synchro < 30) return { tier: "desync", damageMult: 0.85, cooldownMult: 1.0 };
+  return { tier: "steady", damageMult: 1, cooldownMult: 1 };
+}
+
+/**
  * One L0 tick. The agent acts on `directive` ("engage" | "disengage" | ...);
  * viruses run a tiny aggression loop. Mutates state in place, appends events.
  */
@@ -108,12 +127,17 @@ export function tickWorld(
   rand: () => number,
   targetElement?: Element | null,
   nudge?: OperatorNudge | null,
+  synchro = 50,
 ): void {
   const agent = state.fighters.find((f) => f.kind === "agent" && f.hp > 0);
   const viruses = state.fighters.filter((f) => f.kind === "virus" && f.hp > 0);
   if (!agent) return;
 
   for (const f of state.fighters) f.cooldown = Math.max(0, f.cooldown - dt);
+
+  // Coaching made mechanical: the synchro tier scales the agent's basic
+  // attacks. Viruses don't get this — the operator's bond is the edge.
+  const sync = synchroTier(synchro);
 
   const nearest = (from: Fighter, pool: Fighter[]) => {
     let best: Fighter | null = null;
@@ -183,8 +207,13 @@ export function tickWorld(
       const band = rangeBandOf(dist(agent.pos, pick.pos));
       if (band === "melee" && agent.cooldown <= 0) {
         agent.pose = "melee_attack";
-        strike(state, agent, pick, MELEE_POWER * elementMultiplier(agent.element, pick.element));
-        agent.cooldown = ATTACK_COOLDOWN;
+        strike(
+          state,
+          agent,
+          pick,
+          MELEE_POWER * sync.damageMult * elementMultiplier(agent.element, pick.element),
+        );
+        agent.cooldown = ATTACK_COOLDOWN * sync.cooldownMult;
       }
     }
   } else if (pick) {
@@ -226,8 +255,13 @@ export function tickWorld(
         } else if (band === "melee") {
         agent.pose = "melee_attack";
         if (agent.cooldown <= 0) {
-          strike(state, agent, pick, MELEE_POWER * elementMultiplier(agent.element, pick.element));
-          agent.cooldown = ATTACK_COOLDOWN;
+          strike(
+            state,
+            agent,
+            pick,
+            MELEE_POWER * sync.damageMult * elementMultiplier(agent.element, pick.element),
+          );
+          agent.cooldown = ATTACK_COOLDOWN * sync.cooldownMult;
         }
       } else {
         moveToward(agent, pick.pos, dt);
@@ -235,8 +269,13 @@ export function tickWorld(
         // Chip damage at mid range — the Pulse Arm's ranged mode.
         if (band === "mid" && agent.cooldown <= 0 && rand() < 0.5) {
           agent.pose = "ranged_attack";
-          strike(state, agent, pick, RANGED_POWER * elementMultiplier(agent.element, pick.element));
-          agent.cooldown = ATTACK_COOLDOWN;
+          strike(
+            state,
+            agent,
+            pick,
+            RANGED_POWER * sync.damageMult * elementMultiplier(agent.element, pick.element),
+          );
+          agent.cooldown = ATTACK_COOLDOWN * sync.cooldownMult;
         }
       }
     }
@@ -257,32 +296,60 @@ export function tickWorld(
     agent.pos.y = 0;
   }
 
-  // --- Virus L0: drift toward the agent, telegraph, then swipe in melee ---
+  // --- Virus L0: species-driven. Melee species close in, telegraph, and
+  // swipe; spitters hold mid range and spit — jumping won't save you from
+  // spit, lateral movement will. Each species reads its behavior kit. ---
   for (const v of viruses) {
+    const sp = speciesOf(v);
     const d = dist(v.pos, agent.pos);
     if (v.windup != null && v.windup > 0) {
-      // Committed to the swing: the strike lands when the wind-up ends,
-      // but only if the target is still in reach.
+      // Committed to the attack: it lands when the wind-up ends, but only
+      // if the target is still in reach. Melee whiffs if kited out or
+      // jumped; spit only whiffs if the agent leaves mid range entirely.
       v.windup -= dt;
       v.pose = "windup";
       if (v.windup <= 0) {
         v.windup = 0;
-        if (agent.hp > 0 && rangeBandOf(dist(v.pos, agent.pos)) === "melee") {
-          strike(state, v, agent, VIRUS_POWER * elementMultiplier(v.element, agent.element));
+        const band = rangeBandOf(dist(v.pos, agent.pos));
+        const inReach = sp.ranged ? band === "melee" || band === "mid" : band === "melee";
+        if (agent.hp > 0 && inReach) {
+          strike(
+            state,
+            v,
+            agent,
+            VIRUS_POWER * sp.powerMul * elementMultiplier(v.element, agent.element),
+          );
         } else {
-          v.pose = "idle"; // whiffed — the operator kited it out
+          v.pose = "idle"; // whiffed — the operator read it
         }
         v.cooldown = VIRUS_COOLDOWN;
       }
+    } else if (sp.ranged) {
+      // Spitter: keeps its distance, backs off if crowded, spits on cooldown.
+      const band = rangeBandOf(d);
+      if (band === "melee") {
+        moveAway(v, agent.pos, dt * sp.speedMul);
+        v.pose = "run";
+      } else if (band === "mid") {
+        if (v.cooldown <= 0 && rand() < (v.aggression ?? 0.6)) {
+          v.windup = WINDUP_TIME * sp.windupMul;
+          v.pose = "windup";
+        } else {
+          v.pose = "idle";
+        }
+      } else {
+        moveToward(v, agent.pos, dt * 0.8 * sp.speedMul);
+        v.pose = "run";
+      }
     } else if (rangeBandOf(d) === "melee") {
       if (v.cooldown <= 0 && rand() < (v.aggression ?? 0.6)) {
-        v.windup = WINDUP_TIME;
+        v.windup = WINDUP_TIME * sp.windupMul;
         v.pose = "windup";
       } else {
         v.pose = "melee_attack";
       }
     } else {
-      moveToward(v, agent.pos, dt * 0.8);
+      moveToward(v, agent.pos, dt * 0.8 * sp.speedMul);
       v.pose = "run";
     }
   }
@@ -388,40 +455,102 @@ export function applyScript(
  * Spawn a wave of viruses around the agent. Wave 1 is the dive's opening
  * pair; later waves get more numerous, tougher, and meaner. Corpses from
  * earlier waves are cleared.
+ *
+ * The mix is deterministic per wave — balance-testable, and the agent can
+ * genuinely learn it ("wave 3 always brings a spitter" is a memory).
  */
-const VIRUS_POOL: { name: string; element: Element }[] = [
-  { name: "Scrapbit", element: "aqua" },
-  { name: "Glitchwasp", element: "elec" },
-  { name: "Cindercub", element: "fire" },
-  { name: "Mossmite", element: "wood" },
-  { name: "Frostmite", element: "aqua" },
-  { name: "Voltvulture", element: "elec" },
-];
+export function waveComposition(wave: number): string[] {
+  const comp = ["scrapbit", "scrapbit"];
+  if (wave >= 2) comp.push("dasher");
+  if (wave >= 3) comp.push("spitter");
+  if (wave >= 4) comp.push("bulwark", "dasher");
+  if (wave >= 5) comp.push("spitter");
+  return comp.slice(0, Math.min(1 + wave, 6));
+}
+
+/**
+ * Virus species — data-driven behavior kits. Adding a species is a table
+ * row, not a new branch: the L0 reads the kit. Names double as the client
+ * color key, so no schema changes were needed to tell them apart visually.
+ */
+interface VirusSpecies {
+  name: string;
+  element: Element;
+  hpMul: number;
+  speedMul: number;
+  powerMul: number;
+  windupMul: number;
+  /** spitters hold mid range and spit; everyone else closes to melee */
+  ranged: boolean;
+}
+
+const VIRUS_SPECIES: Record<string, VirusSpecies> = {
+  scrapbit: {
+    name: "Scrapbit",
+    element: "aqua",
+    hpMul: 1,
+    speedMul: 1,
+    powerMul: 1,
+    windupMul: 1,
+    ranged: false,
+  },
+  dasher: {
+    name: "Dasher",
+    element: "elec",
+    hpMul: 0.8,
+    speedMul: 1.6,
+    powerMul: 0.85,
+    windupMul: 0.6,
+    ranged: false,
+  },
+  spitter: {
+    name: "Spitter",
+    element: "aqua",
+    hpMul: 0.9,
+    speedMul: 1.1,
+    powerMul: 0.9,
+    windupMul: 0.9,
+    ranged: true,
+  },
+  bulwark: {
+    name: "Bulwark",
+    element: "wood",
+    hpMul: 2.2,
+    speedMul: 0.5,
+    powerMul: 1.7,
+    windupMul: 1.4,
+    ranged: false,
+  },
+};
+
+const speciesOf = (f: Fighter): VirusSpecies =>
+  VIRUS_SPECIES[f.species ?? "scrapbit"] ?? VIRUS_SPECIES.scrapbit;
 
 export function spawnWave(state: WorldState, wave: number, rand: () => number): void {
   state.fighters = state.fighters.filter((f) => f.kind === "agent" || f.hp > 0);
   const agent = state.fighters.find((f) => f.kind === "agent");
   const ax = agent?.pos.x ?? 0;
   const az = agent?.pos.z ?? 0;
-  const count = Math.min(1 + wave, 6);
-  const hp = 40 + wave * 10;
-  for (let i = 0; i < count; i++) {
-    const def = VIRUS_POOL[(wave + i) % VIRUS_POOL.length];
+  const baseHp = 40 + wave * 10;
+  waveComposition(wave).forEach((key, i) => {
+    const sp = VIRUS_SPECIES[key];
     const angle = rand() * Math.PI * 2;
     const d = 7 + rand() * 4;
+    const hp = Math.round(baseHp * sp.hpMul);
     state.fighters.push({
       id: `virus-w${wave}-${i}`,
       kind: "virus",
-      name: def.name,
+      species: key,
+      name: sp.name,
       pos: { x: ax + Math.cos(angle) * d, y: 0, z: az + Math.sin(angle) * d },
       pose: "idle",
       hp,
       maxHp: hp,
-      element: def.element,
+      element: sp.element,
       cooldown: 0,
       aggression: Math.min(0.6 + wave * 0.1, 0.95),
     });
-  }
+  });
 }
 
 export { ELEMENT_BEATS };

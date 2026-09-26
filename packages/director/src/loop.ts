@@ -10,6 +10,7 @@ import {
   applyScript,
   rng,
   spawnWave,
+  synchroTier,
   tickWorld,
   type Fighter,
   type FightStyle,
@@ -441,6 +442,7 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
   let tick = 0;
   let energy = agent.energy;
   let synchro = 50;
+  let syncTier = synchroTier(synchro).tier; // announce tier crossings once
   let directive: "engage" | "disengage" | "hold" | "focus_weakest" | "protect" = "engage";
   let directiveUntil: number | null = null; // tick when a temporary maneuver expires
   let directiveSource: "operator" | "mind" | null = null; // whose judgment currently steers
@@ -745,7 +747,7 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
     while (moveQueue.length > 0 && tick >= moveQueue[0].until) moveQueue.shift();
     const nudge = nudgeForStep(moveQueue[0] ?? null, tick);
 
-    tickWorld(world, TICK_MS / 1000, directive, rand, targetElement, nudge.move || nudge.jump ? nudge : null);
+    tickWorld(world, TICK_MS / 1000, directive, rand, targetElement, nudge.move || nudge.jump ? nudge : null, synchro);
 
     // Drain world events into the Convex feed.
     for (const e of world.events.splice(0)) {
@@ -768,6 +770,28 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
           sessionId,
           tick,
           event: { type: "down", fighterId: e.fighterId },
+        });
+      }
+    }
+
+    // Synchro tiers: coaching quality is mechanical now. Crossing into or out
+    // of a tier is announced once — the operator should feel the shift.
+    // (Steady crossings stay quiet; the feed is for moments, not noise.)
+    const tierNow = synchroTier(synchro).tier;
+    if (tierNow !== syncTier) {
+      syncTier = tierNow;
+      if (tierNow === "in sync" || tierNow === "desync") {
+        await convex.mutation(api.session.pushEvent, {
+          sessionId,
+          tick,
+          event: {
+            type: "dialogue",
+            speaker: `${agent.name}.${agent.ext}`,
+            text:
+              tierNow === "in sync"
+                ? "We're in sync, operator — feel that rhythm. My strikes hit harder and my arm cycles faster."
+                : "I'm losing our rhythm — coach me back, operator. Call the fight with me.",
+          },
         });
       }
     }
