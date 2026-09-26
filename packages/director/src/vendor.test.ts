@@ -44,7 +44,7 @@ describe("VendorMind", () => {
     expect(d.rationale).toMatch(/kiting/);
     expect(mind.lastTokens).toBe(70);
     // Request shape: OpenAI-compatible endpoint, bearer auth, model set.
-    const [url, init] = fetchFn.mock.calls[0] as [string, RequestInit];
+    const [url, init] = (fetchFn.mock.calls as unknown as [string, RequestInit][])[0];
     expect(url).toBe("https://example.test/v1/chat/completions");
     expect((init.headers as Record<string, string>).authorization).toBe("Bearer sk-test");
     expect(JSON.parse(init.body as string).model).toBe("test-model");
@@ -100,7 +100,7 @@ describe("VendorMind", () => {
       opts(fetchFn, "https://example.test/v1/chat/completions"),
     );
     await mind.speak(ctx, "hello");
-    const [url] = fetchFn.mock.calls[0] as [string, RequestInit];
+    const [url] = (fetchFn.mock.calls as unknown as [string, RequestInit][])[0];
     expect(url).toBe("https://example.test/v1/chat/completions");
   });
 
@@ -108,7 +108,7 @@ describe("VendorMind", () => {
     const fetchFn = fakeFetch(chatBody("hi"));
     const mind = new VendorMind(opts(fetchFn, "https://example.test/v1/"));
     await mind.speak(ctx, "hello");
-    const [url] = fetchFn.mock.calls[0] as [string, RequestInit];
+    const [url] = (fetchFn.mock.calls as unknown as [string, RequestInit][])[0];
     expect(url).toBe("https://example.test/v1/chat/completions");
   });
 });
