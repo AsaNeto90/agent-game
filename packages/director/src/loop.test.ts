@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   applyMindDecision,
+  buildWaveDebrief,
   isReadyCommand,
   MIND_MANEUVER_TICKS,
   nudgeForStep,
@@ -385,5 +386,67 @@ describe("applyMindDecision lateral moves", () => {
     );
     expect(queued).toEqual([]);
     expect(summary).toContain("skipped");
+  });
+});
+
+describe("buildWaveDebrief", () => {
+  const base = {
+    wave: 2,
+    ticksTaken: 168,
+    hpStart: 120,
+    hpEnd: 96,
+    maxHp: 120,
+    minHp: 60,
+    virusesKilled: 3,
+    operatorCommands: 2,
+    mindActions: ["orbit", "strafe", "jump", "orbit"],
+    style: "balanced",
+  };
+
+  it("distills an honest, compact memory", () => {
+    const d = buildWaveDebrief(base);
+    expect(d.memory).toContain("Wave 2 (42s): cleared.");
+    expect(d.memory).toContain("Damage 24 (120->96hp).");
+    expect(d.memory).toContain("3 viruses deleted.");
+    expect(d.memory).toContain("pivoted around them, sidestepped, leapt swings");
+    expect(d.memory).toContain("Operator gave 2 commands.");
+    expect(d.bondDelta).toBe(10);
+    expect(d.bondReason).toBe("cleared wave 2");
+  });
+
+  it("rewards a flawless wave", () => {
+    const d = buildWaveDebrief({ ...base, hpEnd: 120, minHp: 120 });
+    expect(d.memory).toContain("Flawless — not a scratch.");
+    expect(d.bondDelta).toBe(15);
+    expect(d.bondReason).toBe("cleared wave 2 flawless");
+    expect(d.reflection).toMatch(/Flawless/);
+  });
+
+  it("notes the close call in the reflection", () => {
+    const d = buildWaveDebrief({ ...base, minHp: 28 });
+    expect(d.memory).toContain("Close call — dropped to 28hp.");
+    expect(d.reflection).toContain("28hp");
+  });
+
+  it("the agent remembers when pivoting worked", () => {
+    const d = buildWaveDebrief(base);
+    expect(d.reflection).toMatch(/Pivoting around them worked/);
+  });
+
+  it("falls back to a plain summary with nothing notable", () => {
+    const d = buildWaveDebrief({
+      ...base,
+      mindActions: ["engage"],
+      operatorCommands: 0,
+      minHp: 96,
+    });
+    expect(d.reflection).toBe("Wave 2 down: 3 deleted, 24 damage taken.");
+    expect(d.memory).not.toContain("Operator gave");
+  });
+
+  it("dedupes repeated mind actions", () => {
+    const d = buildWaveDebrief({ ...base, mindActions: ["jump", "jump", "jump"] });
+    expect(d.memory).toContain("leapt swings");
+    expect(d.memory).not.toContain("leapt swings, leapt swings");
   });
 });

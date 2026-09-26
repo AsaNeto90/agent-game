@@ -56,6 +56,10 @@ export class MockMind implements MindProvider {
   readonly lastTokens = 0;
   private n = 0;
 
+  // NOTE: the mock does not read ctx.recentMemories. Genuine recall needs a
+  // mind that reasons over language — that's the vendor mind's job. The mock
+  // proves the memory plumbing (write → store → inject); the vendor proves
+  // the remembering.
   async decide(ctx: MindContext): Promise<MindDecision> {
     this.n++;
     // Reads the tactical snapshot like a vendor would: survival first,

@@ -83,9 +83,21 @@ export class VendorMind implements MindProvider {
     return this.tokensUsed;
   }
 
+  /** What the agent remembers from past dives — the memory system, in-prompt. */
+  private memoryBlock(ctx: MindContext): string {
+    const mems = (ctx.recentMemories ?? []).slice(-6);
+    if (mems.length === 0) return `Past dives: nothing logged yet — this is a fresh bond.`;
+    return [
+      `What you remember from past dives:`,
+      ...mems.map((m) => `- ${m}`),
+      `Learn from these — repeat what worked, avoid what nearly got you deleted.`,
+    ].join("\n");
+  }
+
   private decideSystem(ctx: MindContext): string {
     return [
       `You are the combat instincts of ${ctx.agentName}.${ctx.agentExt}, a battle companion program fighting rogue viruses in cyberspace while a human operator coaches in real time.`,
+      this.memoryBlock(ctx),
       `Read the situation and pick ONE action. Reply with ONLY a JSON object, no other text:`,
       `{"action": "<one of engage|disengage|hold|focus_weakest|protect|dodge|jump|orbit|strafe>", "style": "<evasive|balanced|null>", "rationale": "<under 12 words>"}`,
       `- engage: close to melee and fight the nearest threat`,
@@ -110,6 +122,7 @@ export class VendorMind implements MindProvider {
       `Personality: brave, a little cocky, talks like a sparring partner who genuinely likes their operator.`,
       `Rules: one or two sentences, never more. Plain text only — no stage directions, no quotation marks around the reply, no emojis. Never break character. Never mention being an AI or language model.`,
       `Current situation: ${ctx.situation}. Bond tier with operator: ${ctx.bondTier}.`,
+      this.memoryBlock(ctx),
     ].join("\n");
   }
 

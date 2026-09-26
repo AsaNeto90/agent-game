@@ -189,10 +189,88 @@ export function visibleFighters(
 }
 
 /**
+ * The wave debrief: distill what just happened into a memory the agent keeps.
+ * Deterministic ($0, testable) — the remembering is factual, the *reasoning*
+ * over it happens in the vendor mind, which gets these in its prompt.
+ */
+export interface WaveDebriefInput {
+  wave: number;
+  ticksTaken: number;
+  hpStart: number;
+  hpEnd: number;
+  maxHp: number;
+  minHp: number;
+  virusesKilled: number;
+  operatorCommands: number;
+  mindActions: string[];
+  style: string;
+}
+
+export interface WaveDebrief {
+  /** persisted to Convex — short, factual, LLM-digestible */
+  memory: string;
+  bondDelta: number;
+  bondReason: string;
+  /** the agent's spoken reflection during the rest phase */
+  reflection: string;
+}
+
+const MIND_ACTION_VERBS: Record<string, string> = {
+  engage: "pressed the attack",
+  disengage: "gave ground",
+  hold: "held position",
+  focus_weakest: "focused the weakest",
+  protect: "covered the operator",
+  dodge: "dashed clear",
+  jump: "leapt swings",
+  orbit: "pivoted around them",
+  strafe: "sidestepped",
+};
+
+export function buildWaveDebrief(i: WaveDebriefInput): WaveDebrief {
+  const secs = Math.round(i.ticksTaken / 4);
+  const damage = Math.max(0, i.hpStart - i.hpEnd);
+  const flawless = damage === 0;
+  const closeCall = i.minHp < i.maxHp * 0.3;
+  const verbs = [...new Set(i.mindActions)]
+    .map((a) => MIND_ACTION_VERBS[a] ?? a)
+    .filter(Boolean);
+  const parts = [
+    `Wave ${i.wave} (${secs}s): cleared.`,
+    `Damage ${damage} (${i.hpStart}->${i.hpEnd}hp).`,
+    `${i.virusesKilled} virus${i.virusesKilled === 1 ? "" : "es"} deleted.`,
+    `Style ${i.style}.`,
+  ];
+  if (verbs.length > 0) parts.push(`I ${verbs.join(", ")}.`);
+  if (i.operatorCommands > 0)
+    parts.push(`Operator gave ${i.operatorCommands} command${i.operatorCommands === 1 ? "" : "s"}.`);
+  if (closeCall) parts.push(`Close call — dropped to ${i.minHp}hp.`);
+  if (flawless) parts.push(`Flawless — not a scratch.`);
+
+  let reflection: string;
+  if (flawless) {
+    reflection = `Flawless — not a scratch on me. Whatever we did, let's do it again.`;
+  } else if (closeCall) {
+    reflection = `That got hairy — down to ${i.minHp}hp at one point. Glad you were coaching.`;
+  } else if (i.mindActions.includes("orbit") && i.operatorCommands > 0) {
+    reflection = `Pivoting around them worked — noted. I'll remember that.`;
+  } else {
+    reflection = `Wave ${i.wave} down: ${i.virusesKilled} deleted, ${damage} damage taken.`;
+  }
+
+  return {
+    memory: parts.join(" "),
+    bondDelta: 10 + (flawless ? 5 : 0),
+    bondReason: `cleared wave ${i.wave}${flawless ? " flawless" : ""}`,
+    reflection,
+  };
+}
+/**
  * Compact tactical snapshot for the mind's decide() — cheap enough to send
- * every few seconds, rich enough to actually fight on.
- * Format: "w2 | 3v: aqua40 melee SWING!, null25 mid WINDUP | agent 70% melee | style balanced"
- * SWING! = a swing landing within ~0.5s. WINDUP = telegraphing, >0.5s out.
+ * every 4s, even to a vendor LLM. Read it like a radar readout:
+ *   "w2 | 3v: aqua40 melee SWING!, null25 mid WINDUP | agent 70% melee | style balanced"
+ * SWING! = a swing landing within ~0.5s (jump now or eat it).
+ * WINDUP  = telegraphing, still time to reposition.
  */
 export function tacticalSituation(world: WorldState, wave: number): string {
   const agent = world.fighters.find((f) => f.kind === "agent");
@@ -304,6 +382,17 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
     agentId: cfg.agentId as Id<"agents">,
   });
   if (!agent) throw new Error(`agent ${cfg.agentId} not found — compile one first (agents:compile)`);
+
+  // Recall: what the agent remembers from past dives. Loaded once at boot,
+  // appended locally after each wave debrief — no re-query mid-dive.
+  const memoryLines = (
+    await convex.query(api.agents.recentMemories, {
+      agentId: cfg.agentId as Id<"agents">,
+      limit: 8,
+    })
+  ).map((m) => m.text);
+  if (memoryLines.length > 0)
+    console.log(`[director] recalled ${memoryLines.length} memories for ${agent.name}.${agent.ext}`);
   const existingSession = await convex.query(api.session.getActive, {
     agentId: cfg.agentId as Id<"agents">,
   });
@@ -368,6 +457,20 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
   };
   let moveQueue: QueuedMove[] = []; // conversational movement sequences, in order
 
+  // Per-wave stats for the debrief — reset at every wave spawn.
+  let waveStartHp = 120;
+  let waveStartTick = 0;
+  let waveMinHp = 120;
+  let waveCommands = 0;
+  const waveMindActions = new Set<string>();
+  const resetWaveStats = (hp: number, tick: number) => {
+    waveStartHp = hp;
+    waveStartTick = tick;
+    waveMinHp = hp;
+    waveCommands = 0;
+    waveMindActions.clear();
+  };
+
   /** Enqueue a parsed movement sequence — steps chain back-to-back. */
   const queueMoves = (seq: MovePrimitive[], tick: number): void => {
     let t = tick;
@@ -411,7 +514,7 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
           agentName: agent.name,
           agentExt: agent.ext,
           bondTier: agent.bondTier,
-          recentMemories: [],
+          recentMemories: memoryLines,
           situation,
         },
         prompt,
@@ -459,7 +562,7 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
             agentName: agent.name,
             agentExt: agent.ext,
             bondTier: agent.bondTier,
-            recentMemories: [],
+            recentMemories: memoryLines,
             situation: "dive start",
           },
           "dive start",
@@ -499,6 +602,7 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
           spawnWave(world, wave, rand);
           const count = Math.min(1 + wave, 6);
           lastOperatorTick = tick;
+          resetWaveStats(world.fighters.find((f) => f.kind === "agent")?.hp ?? 120, tick);
           if (text.trim()) {
             await convex.mutation(api.session.pushEvent, {
               sessionId,
@@ -521,6 +625,7 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
         // Conversational movement wins when the words are movement, not tactics.
         const seq = parseMoveSequence(text);
         const moved = seq.length > 0 && !isTacticalCommand(text);
+        if (!resting) waveCommands++; // coaching that shaped this wave — the debrief counts it
         if (moved) {
           queueMoves(seq, tick);
           synchro = Math.min(100, synchro + 2);
@@ -677,8 +782,20 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
 
     // 2b. Wave control: clears escalate, death ends the dive.
     const agentAlive = (world.fighters.find((f) => f.kind === "agent")?.hp ?? 0) > 0;
+    const agentHpNow = world.fighters.find((f) => f.kind === "agent")?.hp ?? 0;
+    if (!resting && agentAlive) waveMinHp = Math.min(waveMinHp, agentHpNow);
     const virusesAlive = world.fighters.filter((f) => f.kind === "virus" && f.hp > 0).length;
     if (!agentAlive) {
+      // Even in defeat, the agent remembers — how it died shapes the next dive.
+      const killed = world.fighters.filter((f) => f.kind === "virus" && f.hp <= 0).length;
+      await convex.mutation(api.agents.appendMemory, {
+        agentId: cfg.agentId as Id<"agents">,
+        kind: "battle",
+        text:
+          `Wave ${wave} (${Math.round((tick - waveStartTick) / 4)}s): deleted in action. ` +
+          `${killed} virus${killed === 1 ? "" : "es"} downed first. ` +
+          `Style ${world.style ?? "balanced"}. Operator gave ${waveCommands} commands.`,
+      });
       await convex.mutation(api.session.pushEvent, {
         sessionId,
         tick,
@@ -700,6 +817,32 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
       // no timer pressure, and the energy clock pauses while they chat.
       resting = true;
       const a = world.fighters.find((f) => f.kind === "agent")!;
+      // The debrief: distill the wave into a memory BEFORE the breather heal,
+      // so the damage number is honest. Remembering is what makes the next
+      // dive smarter — the mind gets these in its prompt.
+      const debrief = buildWaveDebrief({
+        wave,
+        ticksTaken: tick - waveStartTick,
+        hpStart: waveStartHp,
+        hpEnd: a.hp,
+        maxHp: a.maxHp,
+        minHp: waveMinHp,
+        virusesKilled: world.fighters.filter((f) => f.kind === "virus").length,
+        operatorCommands: waveCommands,
+        mindActions: [...waveMindActions],
+        style: world.style ?? "balanced",
+      });
+      await convex.mutation(api.agents.appendMemory, {
+        agentId: cfg.agentId as Id<"agents">,
+        kind: "battle",
+        text: debrief.memory,
+      });
+      memoryLines.push(debrief.memory); // recall stays fresh — the next wave's mind sees this one
+      const bond = await convex.mutation(api.agents.addBondXp, {
+        agentId: cfg.agentId as Id<"agents">,
+        delta: debrief.bondDelta,
+        reason: debrief.bondReason,
+      });
       a.hp = Math.min(a.maxHp, a.hp + 25); // catch your breath between waves
       synchro = Math.min(100, synchro + 10);
       await convex.mutation(api.session.pushEvent, {
@@ -711,6 +854,27 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
           text: `Wave ${wave} cleared — nice coaching, operator. Catch your breath. Say "next wave" when you're ready.`,
         },
       });
+      // The agent reflects on the wave out loud — the memory system, visible.
+      await convex.mutation(api.session.pushEvent, {
+        sessionId,
+        tick,
+        event: {
+          type: "dialogue",
+          speaker: `${agent.name}.${agent.ext}`,
+          text: debrief.reflection,
+        },
+      });
+      if (bond.leveledUp) {
+        await convex.mutation(api.session.pushEvent, {
+          sessionId,
+          tick,
+          event: {
+            type: "dialogue",
+            speaker: `${agent.name}.${agent.ext}`,
+            text: `I can feel it, operator — we're ${bond.tier} now. The bond is real.`,
+          },
+        });
+      }
       await trace("L1", `wave_cleared:${wave}`, `${wave} down, resting until operator is ready`, 1);
     }
 
@@ -736,7 +900,7 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
           agentName: agent.name,
           agentExt: agent.ext,
           bondTier: agent.bondTier,
-          recentMemories: [],
+          recentMemories: memoryLines,
           situation,
           tactics,
           operatorLines: recentOperatorLines
@@ -746,6 +910,7 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
         })
         .then(async (d) => {
           if (lastOperatorTick !== seenOperatorTick) return; // operator spoke mid-thought — their word stands
+          if (!resting) waveMindActions.add(d.action); // the debrief remembers what the mind did
           const before = world.style ?? "balanced";
           const summary = applyMindDecision(
             world,
@@ -847,7 +1012,7 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
             agentName: agent.name,
             agentExt: agent.ext,
             bondTier: agent.bondTier,
-            recentMemories: [],
+            recentMemories: memoryLines,
             situation,
           },
           "battle banter",

@@ -233,3 +233,43 @@ describe("VendorMind.decide lateral moves", () => {
     expect(strafe.action).toBe("strafe");
   });
 });
+
+describe("VendorMind memory injection", () => {
+  const systemOf = (fetchFn: ReturnType<typeof fakeFetch>) => {
+    const [, init] = (fetchFn.mock.calls as unknown as [string, RequestInit][])[0];
+    const body = JSON.parse(init.body as string);
+    return body.messages.find((m: { role: string }) => m.role === "system").content as string;
+  };
+
+  it("decide prompt carries past-dive memories", async () => {
+    const fetchFn = fakeFetch(chatBody('{"action": "orbit", "rationale": "worked before"}'));
+    const mind = new VendorMind(opts(fetchFn));
+    await mind.decide({
+      ...ctx,
+      recentMemories: ["Wave 2 (42s): cleared. Damage 24 (120->96hp). Pivoting around them worked."],
+      tactics: "w3 | 2v: aqua40 melee | agent 100% melee | style balanced",
+    });
+    const system = systemOf(fetchFn);
+    expect(system).toContain("What you remember from past dives:");
+    expect(system).toContain("Pivoting around them worked.");
+    expect(system).toContain("repeat what worked");
+  });
+
+  it("decide prompt admits a fresh bond honestly", async () => {
+    const fetchFn = fakeFetch(chatBody('{"action": "engage", "rationale": "fresh"}'));
+    const mind = new VendorMind(opts(fetchFn));
+    await mind.decide({ ...ctx, recentMemories: [] });
+    expect(systemOf(fetchFn)).toContain("nothing logged yet");
+  });
+
+  it("speak prompt carries memories too, capped at six", async () => {
+    const fetchFn = fakeFetch(chatBody("Nice pivoting out there."));
+    const mind = new VendorMind(opts(fetchFn));
+    const mems = Array.from({ length: 8 }, (_, i) => `Wave ${i + 1}: cleared.`);
+    await mind.speak({ ...ctx, recentMemories: mems }, "battle banter");
+    const system = systemOf(fetchFn);
+    expect(system).toContain("Wave 8: cleared.");
+    expect(system).not.toContain("Wave 1: cleared."); // oldest fall off the prompt
+    expect(system).not.toContain("Wave 2: cleared.");
+  });
+});
