@@ -5,7 +5,7 @@
 import { ConvexHttpClient } from "convex/browser";
 import { api } from "../../../convex/_generated/api.js";
 import type { Id } from "../../../convex/_generated/dataModel.js";
-import { MockMind, estimateCostUsd, type MindDecision, type MindProvider } from "./mind.js";
+import { MockMind, AGENT_KIT, estimateCostUsd, type MindDecision, type MindProvider } from "./mind.js";
 import {
   applyScript,
   rng,
@@ -16,7 +16,7 @@ import {
   type FightStyle,
   type WorldState,
 } from "./world.js";
-import { rangeBandOf, type Element } from "@agent-game/shared";
+import { STARTER_SCRIPTS, rangeBandOf, type Element } from "@agent-game/shared";
 
 const TICK_MS = 250;
 const ENERGY_DRAIN_PER_TICK = 0.08; // ~100 energy ≈ 5 min of diving
@@ -269,9 +269,11 @@ export function buildWaveDebrief(i: WaveDebriefInput): WaveDebrief {
 /**
  * Compact tactical snapshot for the mind's decide() — cheap enough to send
  * every 4s, even to a vendor LLM. Read it like a radar readout:
- *   "w2 | 3v: aqua40 melee SWING!, null25 mid WINDUP | agent 70% melee | style balanced"
+ *   "w2 | 3v: aqua40(spitter) melee SWING!, null25(scrapbit) mid WINDUP | agent 70% melee | style balanced"
  * SWING! = a swing landing within ~0.5s (jump now or eat it).
  * WINDUP  = telegraphing, still time to reposition.
+ * Species in parens lets the mind tell a bulwark's truck-swing from a
+ * scrapbit's love-tap — and pick the right script for each.
  */
 export function tacticalSituation(world: WorldState, wave: number): string {
   const agent = world.fighters.find((f) => f.kind === "agent");
@@ -283,7 +285,7 @@ export function tacticalSituation(world: WorldState, wave: number): string {
     const band = rangeBandOf(dist2d(agent.pos, v.pos));
     const w = v.windup ?? 0;
     const mark = w > 0.5 ? " WINDUP" : w > 0 ? " SWING!" : "";
-    return `${v.element}${v.hp} ${band}${mark}`;
+    return `${v.element}${v.hp}(${v.species ?? "scrapbit"}) ${band}${mark}`;
   });
   const nearest = viruses.length
     ? rangeBandOf(Math.min(...viruses.map((v) => dist2d(agent.pos, v.pos))))
@@ -363,6 +365,40 @@ export function applyMindDecision(
     done.push(`style:${decision.style}`);
   }
   return done.join(" ");
+}
+
+/** Cooldown on each of the agent's own script casts — 25s at 4Hz. */
+export const AGENT_SCRIPT_COOLDOWN_TICKS = 100;
+
+/** What the agent says when it fires its own script — its hands, its call. */
+const CAST_LINES: Record<string, string> = {
+  "mend-protocol": "patching myself up",
+  "aegis-wall": "brace for it",
+  "static-snare": "snaring the pack",
+  "arc-lance": "finishing the weak one",
+  "cinder-slash": "you asked for fireworks",
+};
+
+/**
+ * Fire one of the agent's own scripts — its L1 decide picked the moment.
+ * Enforces per-script cooldowns; returns the announcement line, or null
+ * when the script isn't ready or doesn't exist. Pure sim + bookkeeping,
+ * no I/O, so tests can drive it directly.
+ */
+export function applyMindScript(
+  world: WorldState,
+  scriptId: string,
+  targetElement: Element | null,
+  tick: number,
+  cooldowns: Map<string, number>,
+): string | null {
+  if ((cooldowns.get(scriptId) ?? 0) > tick) return null;
+  const def = STARTER_SCRIPTS.find((s) => s.id === scriptId);
+  if (!def) return null;
+  const flavor = applyScript(world, scriptId, targetElement);
+  cooldowns.set(scriptId, tick + AGENT_SCRIPT_COOLDOWN_TICKS);
+  const line = CAST_LINES[scriptId] ?? "firing a script of my own";
+  return `${def.name} — ${line}.${flavor ? ` ${flavor}` : ""}`;
 }
 
 interface DirectorConfig {
@@ -448,6 +484,12 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
   let directiveSource: "operator" | "mind" | null = null; // whose judgment currently steers
   let styleByOperator = false; // the operator's word on style is law — the mind won't touch it
   let decideInFlight = false; // one decide() at a time — a slow vendor must not pile up
+  // The agent's own script brain: per-script cooldowns (tick when ready again),
+  // when the operator last slotted one (the agent holds its fire for 10s after —
+  // their cast wins), and whether they said "use something!".
+  const scriptCooldowns = new Map<string, number>();
+  let lastOperatorScriptTick = -1000;
+  let scriptRequested = false;
   // The operator's recent utterances, for the mind's context — a standing
   // order ("pivot around them") steers the mind for ~30s, then lapses.
   const recentOperatorLines: { text: string; tick: number }[] = [];
@@ -597,6 +639,12 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
       const p = intent.payload as Record<string, string>;
       if (intent.type === "command") {
         const text = p.text ?? "";
+        // "use something!" — the operator gives the agent permission to
+        // improvise: the next L1 read of the fight fires its best ready script.
+        const wantsScript = /use (something|a script)|fire (something|a script)|cast (something|a script)/.test(
+          text.toLowerCase(),
+        );
+        if (wantsScript) scriptRequested = true;
         // "Next wave" starts the fight again — only meaningful while resting.
         if (resting && isReadyCommand(text)) {
           resting = false;
@@ -673,11 +721,16 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
               ? `fight style: evasive — the agent leaps and dashes around swings on its own until you say "fight normal"`
               : `fight style: balanced — back to straightforward fighting`,
           );
+        if (wantsScript)
+          notes.push(
+            `script request: the agent fires its own best script on its next read of the fight`,
+          );
         const maneuverNote = notes.length > 0 ? ` (${notes.join("; ")})` : "";
         sayAsync(`operator command: ${text}`, `operator command: ${text}${maneuverNote}`);
         await trace("L1", `command:${directive}`, `operator said "${text}"`, Date.now() - t0);
       } else if (intent.type === "slot_script") {
         synchro = Math.min(100, synchro + 4);
+        lastOperatorScriptTick = tick; // their cast wins — the agent holds its fire for a while
         const flavor = applyScript(world, p.scriptId, targetElement);
         await convex.mutation(api.session.pushEvent, {
           sessionId,
@@ -919,6 +972,12 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
       const seenOperatorTick = lastOperatorTick;
       const t0d = Date.now();
       const tactics = tacticalSituation(world, wave);
+      // The agent's hands: which of its kit scripts are off cooldown, and
+      // whether the operator said "use something!". Consumed on read — a
+      // request that arrives mid-thought waits for the next one.
+      const readyIds = AGENT_KIT.filter((id) => (scriptCooldowns.get(id) ?? 0) <= tick);
+      const wantedScript = scriptRequested;
+      scriptRequested = false;
       cfg.mind
         .decide({
           agentName: agent.name,
@@ -927,6 +986,8 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
           recentMemories: memoryLines,
           situation,
           tactics,
+          scriptsReady: readyIds,
+          scriptRequested: wantedScript,
           operatorLines: recentOperatorLines
             .filter((l) => tick - l.tick < 120)
             .map((l) => l.text)
@@ -953,6 +1014,40 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
             },
             { styleLocked: styleByOperator, queueBusy: moveQueue.length > 0 },
           );
+          // The agent's own script brain: it picked the moment, the loop
+          // enforces cooldowns and operator priority. The operator's word is
+          // law — no self-casting for 10s after they slotted one themselves.
+          if (d.script && tick - lastOperatorScriptTick > 40) {
+            const line = applyMindScript(
+              world,
+              d.script.scriptId,
+              d.script.targetElement ?? targetElement,
+              tick,
+              scriptCooldowns,
+            );
+            if (line) {
+              waveMindActions.add(`script:${d.script.scriptId}`); // the debrief remembers
+              await convex.mutation(api.session.pushEvent, {
+                sessionId,
+                tick,
+                event: {
+                  type: "script_fired",
+                  scriptId: d.script.scriptId,
+                  byId: `agent-${agent._id}`,
+                },
+              });
+              await convex.mutation(api.session.pushEvent, {
+                sessionId,
+                tick,
+                event: {
+                  type: "dialogue",
+                  speaker: `${agent.name}.${agent.ext}`,
+                  text: line,
+                },
+              });
+              await trace("L1", `mind_script:${d.script.scriptId}`, line, 1);
+            }
+          }
           await trace(
             "L1",
             "mind_decide",

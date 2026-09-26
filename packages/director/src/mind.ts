@@ -19,6 +19,10 @@ export interface MindContext {
   /** The operator's recent words — lets the mind honor casual requests
    *  ("be careful", "go aggressive") with no keyword parsing needed. */
   operatorLines?: string[];
+  /** Script ids the agent may cast right now (off cooldown). Empty = hands tied. */
+  scriptsReady?: string[];
+  /** The operator said "use something" — cast the best ready script for the situation. */
+  scriptRequested?: boolean;
 }
 
 export interface MindDecision {
@@ -36,7 +40,60 @@ export interface MindDecision {
   /** Persistent stance the mind adopts for itself — the loop ignores it
    *  while the operator holds the style lock. */
   style?: "evasive" | "balanced";
+  /** Fire one of the agent's own scripts this tick — the loop enforces
+   *  cooldowns and operator priority; the mind just picks the moment. */
+  script?: { scriptId: string; targetElement?: Element | null };
   rationale: string;
+}
+
+/**
+ * The agent's own script kit — the scripts it has "equipped" and may fire
+ * on its own judgment. A subset of the starter library: the operator's
+ * collection is bigger, but these are the agent's hands, not the operator's.
+ */
+export const AGENT_KIT = [
+  "mend-protocol",
+  "aegis-wall",
+  "static-snare",
+  "arc-lance",
+  "cinder-slash",
+] as const;
+
+/**
+ * Pure script policy: which script the agent should fire itself, if any.
+ * Survival first (mend when hurt), then bracing (aegis vs a winding bulwark),
+ * then crowd control (snare the pack), then finishing (lance the weak one).
+ * A "use something!" request relaxes the thresholds — the operator gave
+ * permission to improvise, so the agent finds a reason instead of waiting
+ * for one. Reads the same tactics radar as decide().
+ */
+export function pickScript(ctx: MindContext): { scriptId: string } | undefined {
+  const ready = new Set(ctx.scriptsReady ?? []);
+  const can = (id: string) => (AGENT_KIT as readonly string[]).includes(id) && ready.has(id);
+  const t = ctx.tactics ?? ctx.situation;
+  const hp = /agent (\d+)%/.exec(t);
+  const agentHp = hp ? parseInt(hp[1], 10) : 100;
+  // Per-virus readout: "aqua40(spitter) mid WINDUP" — species in parens,
+  // optional so legacy readouts ("aqua40 mid") still parse as scrapbits.
+  const viruses = [
+    ...t.matchAll(/(\w+?)(\d+)(?:\((\w+)\))? (melee|mid|long|far)( WINDUP| SWING!)?/g),
+  ];
+  const hps = viruses.map((m) => parseInt(m[2], 10));
+  const weakest = hps.length ? Math.min(...hps) : Infinity;
+  const bulwarkWinding = viruses.some((m) => (m[3] ?? "scrapbit") === "bulwark" && !!(m[5] ?? "").trim());
+  const requested = !!ctx.scriptRequested;
+
+  if ((agentHp < 40 || (requested && agentHp < 70)) && can("mend-protocol"))
+    return { scriptId: "mend-protocol" };
+  if (bulwarkWinding && can("aegis-wall")) return { scriptId: "aegis-wall" };
+  if (viruses.length >= 3 && can("static-snare")) return { scriptId: "static-snare" };
+  if (weakest <= 20 && can("arc-lance")) return { scriptId: "arc-lance" };
+  if (requested) {
+    if (can("cinder-slash")) return { scriptId: "cinder-slash" };
+    const any = AGENT_KIT.find((id) => ready.has(id));
+    if (any) return { scriptId: any };
+  }
+  return undefined;
 }
 
 export interface MindProvider {
@@ -62,6 +119,11 @@ export class MockMind implements MindProvider {
   // the remembering.
   async decide(ctx: MindContext): Promise<MindDecision> {
     this.n++;
+    // The agent's own script brain: reads the same radar and may fire one
+    // of its kit scripts alongside whatever maneuver it picks.
+    const script = pickScript(ctx);
+    const withScript = (d: MindDecision): MindDecision =>
+      script ? { ...d, script } : d;
     // Reads the tactical snapshot like a vendor would: survival first,
     // then imminent swings, then repositioning, then pack tactics.
     // Tactics format: "w2 | 3v: aqua40 melee SWING!, null25 mid WINDUP | agent 70% melee | style balanced"
@@ -77,32 +139,32 @@ export class MockMind implements MindProvider {
     // The operator asked to circle them — keep pivoting, don't retreat.
     // An explicit movement request beats the tactical read, every time.
     if (/pivot|orbit|around them|around him|around it|circles? around/.test(lines)) {
-      return { action: "orbit", rationale: "pivoting around them, operator" };
+      return withScript({ action: "orbit", rationale: "pivoting around them, operator" });
     }
     // Hurt -> disengage and go evasive on your own. No keyword required.
     if (agentHp < 35) {
-      return { action: "disengage", style: "evasive", rationale: "hurt — going evasive" };
+      return withScript({ action: "disengage", style: "evasive", rationale: "hurt — going evasive" });
     }
     // A swing about to land in melee -> leap it.
     if (swings > 0 && /agent \d+% melee/.test(t)) {
-      return { action: "jump", rationale: "leaping the swing" };
+      return withScript({ action: "jump", rationale: "leaping the swing" });
     }
     // One swing telegraphing in melee — sidestep it without giving ground.
     if (swings === 0 && windups === 1 && /agent \d+% melee/.test(t)) {
-      return { action: "strafe", rationale: "sidestepping the swing" };
+      return withScript({ action: "strafe", rationale: "sidestepping the swing" });
     }
     // Multiple telegraphs -> reposition before they converge.
     if (windups >= 2) {
-      return { action: "dodge", rationale: "too many swings — repositioning" };
+      return withScript({ action: "dodge", rationale: "too many swings — repositioning" });
     }
     // Recovered -> drop the evasive stance you adopted yourself.
     if (style === "evasive" && agentHp > 60) {
-      return { action: "engage", style: "balanced", rationale: "patched up — pressing again" };
+      return withScript({ action: "engage", style: "balanced", rationale: "patched up — pressing again" });
     }
     if (viruses >= 3) {
-      return { action: "focus_weakest", rationale: "outnumbered — thinning the pack" };
+      return withScript({ action: "focus_weakest", rationale: "outnumbered — thinning the pack" });
     }
-    return { action: "engage", rationale: "on the nearest threat" };
+    return withScript({ action: "engage", rationale: "on the nearest threat" });
   }
 
   async speak(ctx: MindContext, prompt: string): Promise<string> {

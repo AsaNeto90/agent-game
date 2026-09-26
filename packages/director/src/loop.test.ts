@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  AGENT_SCRIPT_COOLDOWN_TICKS,
   applyMindDecision,
+  applyMindScript,
   buildWaveDebrief,
   isReadyCommand,
   MIND_MANEUVER_TICKS,
@@ -208,7 +210,7 @@ describe("tacticalSituation", () => {
       style: "balanced" as const,
     };
     const s = tacticalSituation(world, 2);
-    expect(s).toBe("w2 | 2v: aqua40 melee SWING!, fire25 mid WINDUP | agent 80% melee | style balanced");
+    expect(s).toBe("w2 | 2v: aqua40(scrapbit) melee SWING!, fire25(scrapbit) mid WINDUP | agent 80% melee | style balanced");
   });
 
   it("handles a cleared arena", () => {
@@ -448,5 +450,73 @@ describe("buildWaveDebrief", () => {
     const d = buildWaveDebrief({ ...base, mindActions: ["jump", "jump", "jump"] });
     expect(d.memory).toContain("leapt swings");
     expect(d.memory).not.toContain("leapt swings, leapt swings");
+  });
+});
+
+describe("agent's own script casting", () => {
+  const mkAgent = (hp: number): Fighter => ({
+    id: "agent-1",
+    kind: "agent",
+    name: "agent",
+    pos: { x: 0, y: 0, z: 0 },
+    pose: "idle",
+    hp,
+    maxHp: 120,
+    element: "null",
+    cooldown: 0,
+  });
+  const mkVirus = (id: string, species: string, hp: number): Fighter => ({
+    id,
+    kind: "virus",
+    name: id,
+    pos: { x: 2, y: 0, z: 0 },
+    pose: "idle",
+    hp,
+    maxHp: hp,
+    element: "null",
+    cooldown: 0,
+    species,
+  });
+
+  it("names the species in the radar so the mind can tell a bulwark from a scrapbit", () => {
+    const world = {
+      fighters: [mkAgent(120), mkVirus("v1", "bulwark", 176), mkVirus("v2", "dasher", 32)],
+      events: [],
+      style: "balanced" as const,
+    };
+    const s = tacticalSituation(world, 4);
+    expect(s).toContain("null176(bulwark)");
+    expect(s).toContain("null32(dasher)");
+  });
+
+  it("applyMindScript heals the agent and starts the cooldown", () => {
+    const world = { fighters: [mkAgent(60), mkVirus("v1", "scrapbit", 40)], events: [] };
+    const cooldowns = new Map<string, number>();
+    const line = applyMindScript(world, "mend-protocol", null, 100, cooldowns);
+    expect(line).toMatch(/Mend Protocol/);
+    expect(world.fighters[0].hp).toBeGreaterThan(60);
+    expect(cooldowns.get("mend-protocol")).toBe(100 + AGENT_SCRIPT_COOLDOWN_TICKS);
+  });
+
+  it("applyMindScript refuses while on cooldown", () => {
+    const world = { fighters: [mkAgent(60), mkVirus("v1", "scrapbit", 40)], events: [] };
+    const cooldowns = new Map<string, number>([["mend-protocol", 500]]);
+    expect(applyMindScript(world, "mend-protocol", null, 100, cooldowns)).toBeNull();
+    expect(world.fighters[0].hp).toBe(60); // untouched
+    // ...but fires again once the cooldown lapses
+    const line = applyMindScript(world, "mend-protocol", null, 500, cooldowns);
+    expect(line).toMatch(/Mend Protocol/);
+  });
+
+  it("applyMindScript rejects unknown scripts", () => {
+    const world = { fighters: [mkAgent(60)], events: [] };
+    expect(applyMindScript(world, "nonsense", null, 0, new Map())).toBeNull();
+  });
+
+  it("aegis-wall raises a shield on the agent", () => {
+    const world = { fighters: [mkAgent(120), mkVirus("v1", "bulwark", 176)], events: [] };
+    const line = applyMindScript(world, "aegis-wall", null, 0, new Map());
+    expect(line).toMatch(/Aegis Wall/);
+    expect(world.fighters[0].shield).toBeGreaterThan(0);
   });
 });

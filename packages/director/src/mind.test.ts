@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MockMind, type MindContext } from "./mind.js";
+import { MockMind, pickScript, AGENT_KIT, type MindContext } from "./mind.js";
 
 const ctx: MindContext = {
   agentName: "AstroMan",
@@ -134,5 +134,87 @@ describe("MockMind.decide lateral movement", () => {
   it("still leaps the swing that's about to land", async () => {
     const d = await mind.decide(tctx("w2 | 1v: aqua40 melee SWING! | agent 80% melee | style balanced"));
     expect(d.action).toBe("jump");
+  });
+});
+
+describe("pickScript — the agent's own script brain", () => {
+  const KIT = [...AGENT_KIT];
+  const sctx = (tactics: string, scriptsReady: string[] = KIT, scriptRequested = false): MindContext => ({
+    agentName: "AstroMan",
+    agentExt: "PY",
+    bondTier: "spark",
+    recentMemories: [],
+    situation: "",
+    tactics,
+    scriptsReady,
+    scriptRequested,
+  });
+
+  it("mends itself when hurt", () => {
+    const s = pickScript(sctx("w2 | 2v: aqua40(scrapbit) melee, null25(scrapbit) mid | agent 30% melee | style balanced"));
+    expect(s?.scriptId).toBe("mend-protocol");
+  });
+
+  it("braces with aegis-wall when a bulwark winds up", () => {
+    const s = pickScript(sctx("w4 | 2v: wood176(bulwark) melee WINDUP, aqua40(scrapbit) mid | agent 80% melee | style balanced"));
+    expect(s?.scriptId).toBe("aegis-wall");
+  });
+
+  it("snares the pack when outnumbered", () => {
+    const s = pickScript(
+      sctx("w3 | 3v: aqua40(scrapbit) melee, null25(dasher) mid, elec30(spitter) mid | agent 80% melee | style balanced"),
+    );
+    expect(s?.scriptId).toBe("static-snare");
+  });
+
+  it("lances a virus that's almost down", () => {
+    const s = pickScript(sctx("w2 | 2v: aqua15(scrapbit) mid, null40(scrapbit) far | agent 90% mid | style balanced"));
+    expect(s?.scriptId).toBe("arc-lance");
+  });
+
+  it("keeps its hands down when the moment isn't right", () => {
+    const s = pickScript(sctx("w1 | 1v: aqua40(scrapbit) mid | agent 100% mid | style balanced"));
+    expect(s).toBeUndefined();
+  });
+
+  it("fires nothing when everything is on cooldown", () => {
+    const s = pickScript(sctx("w2 | 2v: aqua40(scrapbit) melee | agent 20% melee | style balanced", []));
+    expect(s).toBeUndefined();
+  });
+
+  it("never picks outside its kit", () => {
+    const s = pickScript(sctx("w2 | 2v: aqua40(scrapbit) melee | agent 20% melee | style balanced", ["ghostphase"]));
+    expect(s).toBeUndefined();
+  });
+
+  it('"use something!" relaxes the heal threshold and finds a reason', () => {
+    const mend = pickScript(
+      sctx("w2 | 1v: aqua40(scrapbit) mid | agent 60% mid | style balanced", KIT, true),
+    );
+    expect(mend?.scriptId).toBe("mend-protocol");
+    const boom = pickScript(sctx("w1 | 1v: aqua40(scrapbit) mid | agent 100% mid | style balanced", KIT, true));
+    expect(boom?.scriptId).toBe("cinder-slash");
+  });
+
+  it("parses the legacy readout without species", () => {
+    const s = pickScript(sctx("w2 | 2v: aqua40 melee, null25 mid | agent 30% melee | style balanced"));
+    expect(s?.scriptId).toBe("mend-protocol");
+  });
+
+  it("MockMind attaches the script alongside its maneuver", async () => {
+    const mind = new MockMind();
+    const d = await mind.decide(
+      sctx("w2 | 2v: aqua40(scrapbit) melee, null25(scrapbit) mid | agent 20% melee | style balanced"),
+    );
+    expect(d.action).toBe("disengage"); // survival maneuver unchanged
+    expect(d.script?.scriptId).toBe("mend-protocol"); // plus its own hands
+  });
+
+  it("MockMind omits the script when the kit is on cooldown", async () => {
+    const mind = new MockMind();
+    const d = await mind.decide(
+      sctx("w2 | 2v: aqua40(scrapbit) melee | agent 20% melee | style balanced", []),
+    );
+    expect(d.script).toBeUndefined();
   });
 });
