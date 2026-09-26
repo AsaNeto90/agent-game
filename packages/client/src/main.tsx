@@ -149,6 +149,13 @@ function Hud({ sessionId }: { sessionId: Id<"sessions"> }) {
   const renderEvent = (e: BrainEvent, i: number) => {
     switch (e.type) {
       case "dialogue":
+        if (e.speaker === "OPERATOR") {
+          return (
+            <div key={i} style={{ color: "#8ad8ff" }}>
+              <b>You:</b> {e.text}
+            </div>
+          );
+        }
         return (
           <div key={i}>
             <b>{e.speaker}:</b> {e.text}

@@ -50,16 +50,63 @@ export class MockMind implements MindProvider {
 
   async speak(ctx: MindContext, prompt: string): Promise<string> {
     this.n++;
+    const tag = `${ctx.agentName}.${ctx.agentExt}`;
+
+    // Operator commands get specific acknowledgments — a command answered
+    // with a non-sequitur feels like not being heard at all.
+    const cmd = /^operator command:\s*(.*)/i.exec(prompt);
+    if (cmd) {
+      const text = cmd[1].toLowerCase();
+      if (/retreat|fall back|disengage|pull back/.test(text))
+        return `Falling back — regrouping, operator.`;
+      if (/hold|wait|steady|stop|stay/.test(text)) return `Holding position. Waiting for your call.`;
+      if (/focus|weakest|thin|target/.test(text)) return `On the weakest one — thinning the pack.`;
+      if (/flank|left|right|around/.test(text)) return `Flanking. Keep their eyes on me.`;
+      if (/attack|engage|fight|hit|strike|kill|delete|get them/.test(text)) return `Engaging!`;
+      if (/script|chip|slot|fire|blast/.test(text)) return `Script acknowledged — say the word and it's lit.`;
+      return `On it — ${tag} moving.`;
+    }
+
+    // Periodic battle banter — reads the actual situation, so the agent
+    // comments on the fight instead of looping three random lines.
+    if (/battle banter/i.test(prompt)) {
+      const count = /^(\d+) viruses?/.exec(ctx.situation);
+      const n = count ? parseInt(count[1], 10) : 1;
+      if (/hp low/.test(ctx.situation)) {
+        const lines = [
+          `I'm hurting, operator — armor's flickering.`,
+          `Systems dimming... I can still fight. Keep coaching me.`,
+        ];
+        return lines[this.n % lines.length];
+      }
+      if (n === 0) return `Grid's clear. ...for now.`;
+      if (n === 1) {
+        const lines = [`One left. It's mine.`, `Last one dancing. Watch this.`];
+        return lines[this.n % lines.length];
+      }
+      const lines = [
+        `Two on me — I like those odds.`,
+        `They're circling. Keep the scripts coming, operator.`,
+        `My call: we press the advantage.`,
+      ];
+      return lines[this.n % lines.length];
+    }
+
+    if (/dive start/i.test(prompt)) return `Jacked in. ${tag} on the grid — what are we hunting today?`;
+    if (/tired|rest|beat|exhausted|recharge/i.test(prompt))
+      return `I'm running warm, but I've got one more dive in me.`;
+    if (/hello|hi\b|hey|yo\b|morning/i.test(prompt))
+      return `Hey. ${tag} here — bond's at ${ctx.bondTier}. What's the plan?`;
+    if (/thank|thanks|thx|nice|good job|well done|awesome/i.test(prompt)) return `Heh. All in a day's dive.`;
+    if (/who are you|your name|introduce/i.test(prompt))
+      return `${tag} — your agent. Compiled, bonded, and itching for a fight.`;
+    if (/\?\s*$/.test(prompt)) return `My call: we press the advantage.`;
+
     const lines = [
       `Reading you loud and clear, operator.`,
-      `On it — ${ctx.agentName}.${ctx.agentExt} moving.`,
       `Heh. Did you see that last one?`,
-      `My call: we press the advantage.`,
       `Give me a target and a script, I'll give you a deleted virus.`,
     ];
-    if (/tired|rest|beat/i.test(prompt)) return `I'm running warm, but I've got one more dive in me.`;
-    if (/hello|hi|hey|morning/i.test(prompt))
-      return `Hey. ${ctx.agentName}.${ctx.agentExt} here — bond's at ${ctx.bondTier}. What are we hunting today?`;
     return lines[this.n % lines.length];
   }
 }

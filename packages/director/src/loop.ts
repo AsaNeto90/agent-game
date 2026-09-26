@@ -151,6 +151,14 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
         else if (/focus|weakest|thin/.test(text)) directive = "focus_weakest";
         else directive = "engage";
         synchro = Math.min(100, synchro + 2); // good coaching nudges synchro up
+        // The operator's words appear in the feed — a dialogue needs both sides.
+        if ((p.text ?? "").trim()) {
+          await convex.mutation(api.session.pushEvent, {
+            sessionId,
+            tick,
+            event: { type: "dialogue", speaker: "OPERATOR", text: p.text as string },
+          });
+        }
         // The operator's words get an answer — commands are visible in the feed.
         const ack = await cfg.mind.speak(
           {
@@ -177,6 +185,14 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
         });
         await trace("L1", `slot_script:${p.scriptId}`, "operator slotted a script mid-battle", 1);
       } else if (intent.type === "chat") {
+        const text = p.text ?? "";
+        if (text.trim()) {
+          await convex.mutation(api.session.pushEvent, {
+            sessionId,
+            tick,
+            event: { type: "dialogue", speaker: "OPERATOR", text },
+          });
+        }
         const reply = await cfg.mind.speak(
           {
             agentName: agent.name,
