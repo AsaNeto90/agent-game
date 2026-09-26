@@ -6,6 +6,7 @@
 import {
   ELEMENT_BEATS,
   elementMultiplier,
+  RANGE_BAND_METERS,
   rangeBandOf,
   STARTER_SCRIPTS,
   type Element,
@@ -35,11 +36,15 @@ export interface Fighter {
    * still in range — kiting out dodges it, killing the attacker cancels it.
    */
   windup?: number;
+  /** seconds left airborne — a jumping fighter leaps clean over melee swings */
+  airborne?: number;
 }
 
 export interface WorldState {
   fighters: Fighter[];
   events: WorldEvent[];
+  /** Operator-set fight style — persists across waves until changed. */
+  style?: FightStyle;
 }
 
 export type WorldEvent =
@@ -73,12 +78,36 @@ const MOVE_SPEED = 3.2; // m/s
  * One L0 tick. The agent acts on `directive` ("engage" | "disengage" | ...);
  * viruses run a tiny aggression loop. Mutates state in place, appends events.
  */
+/** How long a jump keeps the fighter airborne (seconds). */
+export const JUMP_DURATION = 0.6;
+
+/** Operator-set fight style: "balanced" is the default; "evasive" dodges on its own. */
+export type FightStyle = "balanced" | "evasive";
+
+/**
+ * The operator's micro-override for one tick: a movement step, a jump, or both.
+ * Movement is camera-relative — the camera never rotates, so right is always
+ * +x, forward (away from the camera) is always -z.
+ */
+export interface OperatorNudge {
+  move?: {
+    dx: number;
+    dz: number;
+    dash: boolean;
+    flee?: boolean;
+    /** circle the nearest virus instead of moving dx/dz — "pivot around them" */
+    orbit?: boolean;
+  } | null;
+  jump?: boolean;
+}
+
 export function tickWorld(
   state: WorldState,
   dt: number,
   directive: "engage" | "disengage" | "hold" | "focus_weakest" | "protect",
   rand: () => number,
   targetElement?: Element | null,
+  nudge?: OperatorNudge | null,
 ): void {
   const agent = state.fighters.find((f) => f.kind === "agent" && f.hp > 0);
   const viruses = state.fighters.filter((f) => f.kind === "virus" && f.hp > 0);
@@ -100,16 +129,65 @@ export function tickWorld(
   };
 
   // --- Agent L0 reflex ---
-  if (viruses.length > 0) {
-    const pick =
-      directive === "focus_weakest"
+  // Target selection only matters while something is alive to fight.
+  const pick =
+    viruses.length > 0
+      ? directive === "focus_weakest"
         ? viruses.reduce((a, b) => (a.hp <= b.hp ? a : b))
         : targetElement && viruses.some((v) => v.element === targetElement)
           ? nearest(
               agent,
               viruses.filter((v) => v.element === targetElement),
             )!.target
-          : nearest(agent, viruses)!.target;
+          : nearest(agent, viruses)!.target
+      : null;
+
+  const mv = nudge?.move;
+  if (mv && (mv.dx !== 0 || mv.dz !== 0 || mv.flee || mv.orbit)) {
+    // Operator micro-override: highest priority, and it works even with no
+    // live viruses — the breather between waves is the playground.
+    let dx = mv.dx;
+    let dz = mv.dz;
+    if (mv.flee) {
+      const threat = nearest(agent, viruses)?.target;
+      if (threat) {
+        dx = agent.pos.x - threat.pos.x;
+        dz = agent.pos.z - threat.pos.z;
+        const l = Math.hypot(dx, dz) || 1;
+        dx /= l;
+        dz /= l;
+      }
+    } else if (mv.orbit) {
+      const threat = nearest(agent, viruses)?.target;
+      if (threat) {
+        // Tangent around the threat — pivot around them, holding distance.
+        // Recomputed live every tick, so the circle tracks a moving target.
+        const rx = agent.pos.x - threat.pos.x;
+        const rz = agent.pos.z - threat.pos.z;
+        const l = Math.hypot(rx, rz) || 1;
+        dx = -rz / l;
+        dz = rx / l;
+      } else {
+        dx = 0;
+        dz = 0;
+      }
+    }
+    moveToward(
+      agent,
+      { x: agent.pos.x + dx * 6, y: 0, z: agent.pos.z + dz * 6 },
+      mv.dash ? dt * 1.8 : dt,
+    );
+    agent.pose = mv.dash ? "dash" : "run";
+    // Still swings if a virus is in reach — walk and punch.
+    if (pick) {
+      const band = rangeBandOf(dist(agent.pos, pick.pos));
+      if (band === "melee" && agent.cooldown <= 0) {
+        agent.pose = "melee_attack";
+        strike(state, agent, pick, MELEE_POWER * elementMultiplier(agent.element, pick.element));
+        agent.cooldown = ATTACK_COOLDOWN;
+      }
+    }
+  } else if (pick) {
     const d = dist(agent.pos, pick.pos);
     const band: RangeBand = rangeBandOf(d);
 
@@ -119,7 +197,33 @@ export function tickWorld(
     } else if (directive === "hold") {
       agent.pose = "idle";
     } else {
-      if (band === "melee") {
+      const evasive = (state.style ?? "balanced") === "evasive";
+      // Evasive style: leap a swing that's about to land — timed late so the
+      // 0.6s of airtime covers the impact. The jump physics below arcs it.
+      const imminent = evasive
+        ? viruses.filter(
+            (v) =>
+              (v.windup ?? 0) > 0 &&
+              (v.windup ?? 0) <= 0.5 &&
+              dist(agent.pos, v.pos) < RANGE_BAND_METERS.melee + 1.5,
+          )
+        : [];
+      if (imminent.length > 0 && (agent.airborne ?? 0) <= 0) {
+        agent.airborne = JUMP_DURATION;
+      } else {
+        // Autonomous footwork: the agent reads the fight itself. If viruses
+        // are winding up swings in reach, it gives ground on its own —
+        // the operator's "fall back" is a nudge, not a steering wheel.
+        // Evasive style reacts to a single wind-up; balanced waits for two.
+        const closingIn = viruses.filter(
+          (v) => (v.windup ?? 0) > 0 && dist(agent.pos, v.pos) < RANGE_BAND_METERS.melee + 2.5,
+        );
+        if (closingIn.length >= (evasive ? 1 : 2)) {
+          const cx = closingIn.reduce((s, v) => s + v.pos.x, 0) / closingIn.length;
+          const cz = closingIn.reduce((s, v) => s + v.pos.z, 0) / closingIn.length;
+          moveAway(agent, { x: cx, y: 0, z: cz }, evasive ? dt * 1.6 : dt);
+          agent.pose = evasive ? "dash" : "run";
+        } else if (band === "melee") {
         agent.pose = "melee_attack";
         if (agent.cooldown <= 0) {
           strike(state, agent, pick, MELEE_POWER * elementMultiplier(agent.element, pick.element));
@@ -136,8 +240,21 @@ export function tickWorld(
         }
       }
     }
+    }
   } else {
     agent.pose = "idle";
+  }
+
+  // Jump physics: trigger, arc, land. Airborne beats melee swings.
+  // Works anywhere — hop around the breather all you like.
+  if (nudge?.jump && (agent.airborne ?? 0) <= 0) agent.airborne = JUMP_DURATION;
+  if ((agent.airborne ?? 0) > 0) {
+    agent.airborne! -= dt;
+    const p = 1 - Math.max(0, agent.airborne!) / JUMP_DURATION;
+    agent.pos.y = 1.6 * Math.sin(Math.PI * Math.min(1, Math.max(0, p)));
+    agent.pose = "jump";
+  } else {
+    agent.pos.y = 0;
   }
 
   // --- Virus L0: drift toward the agent, telegraph, then swipe in melee ---
@@ -188,6 +305,8 @@ function moveAway(f: Fighter, from: Vec3, dt: number): void {
 }
 
 function strike(state: WorldState, attacker: Fighter, target: Fighter, raw: number): void {
+  // A jumping fighter leaps clean over melee swings — time it right.
+  if ((target.airborne ?? 0) > 0 && rangeBandOf(dist(attacker.pos, target.pos)) === "melee") return;
   let damage = Math.max(1, Math.round(raw));
   // Barrier shields absorb first.
   const shield = target.shield ?? 0;

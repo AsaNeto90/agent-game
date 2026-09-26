@@ -24,7 +24,17 @@ const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai
 const DEFAULT_MODEL = "gemini-3.8-flash";
 const DEFAULT_TIMEOUT_MS = 30_000;
 
-const ACTIONS = ["engage", "disengage", "hold", "focus_weakest", "protect"] as const;
+const ACTIONS = [
+  "engage",
+  "disengage",
+  "hold",
+  "focus_weakest",
+  "protect",
+  "dodge",
+  "jump",
+  "orbit",
+  "strafe",
+] as const;
 
 export interface VendorMindOptions {
   /** Display name for traces, e.g. "gemini". */
@@ -77,12 +87,20 @@ export class VendorMind implements MindProvider {
     return [
       `You are the combat instincts of ${ctx.agentName}.${ctx.agentExt}, a battle companion program fighting rogue viruses in cyberspace while a human operator coaches in real time.`,
       `Read the situation and pick ONE action. Reply with ONLY a JSON object, no other text:`,
-      `{"action": "<one of engage|disengage|hold|focus_weakest|protect>", "rationale": "<under 12 words>"}`,
+      `{"action": "<one of engage|disengage|hold|focus_weakest|protect|dodge|jump|orbit|strafe>", "style": "<evasive|balanced|null>", "rationale": "<under 12 words>"}`,
       `- engage: close to melee and fight the nearest threat`,
       `- disengage: fall back and create distance (use when hurt or outnumbered)`,
       `- hold: stay put, wait for the operator's call`,
       `- focus_weakest: target the weakest virus to thin the pack`,
       `- protect: body-block between the viruses and whatever the operator cares about`,
+      `- dodge: quick dash away from the nearest virus to reposition`,
+      `- jump: leap — dodges a melee swing about to land (marked SWING! in the situation)`,
+      `- orbit: circle around the nearest virus for a few seconds, holding distance (use when the operator asks to pivot/circle them, or to reposition without retreating)`,
+      `- strafe: quick lateral dash — sidesteps a telegraphed swing without giving ground`,
+      `- style: your persistent stance. "evasive" makes you favor dodging and jumping on your own; "balanced" fights straightforward; null leaves it unchanged. Go evasive yourself when hurt — don't wait to be told.`,
+      `The operator's recent words are given with the situation — honor casual requests ("be careful", "go aggressive") even when they don't match a command word.`,
+      `Situation format: "w2 | 3v: aqua40 melee SWING!, null25 mid WINDUP | agent 70% melee | style balanced".`,
+      `SWING! = a swing landing within half a second — jump only helps if you are in melee when it lands. WINDUP = telegraphing, still time to reposition.`,
     ].join("\n");
   }
 
@@ -150,16 +168,25 @@ export class VendorMind implements MindProvider {
   }
 
   async decide(ctx: MindContext): Promise<MindDecision> {
-    const raw = await this.chat(this.decideSystem(ctx), `Situation: ${ctx.situation}`, 120);
+    const lines = (ctx.operatorLines ?? []).map((l) => l.trim()).filter(Boolean);
+    const user = [
+      `Situation: ${ctx.tactics ?? ctx.situation}`,
+      lines.length > 0
+        ? `Operator's recent words: ${lines.map((l) => `"${l}"`).join(" ")}`
+        : `Operator's recent words: none`,
+    ].join("\n");
+    const raw = await this.chat(this.decideSystem(ctx), user, 150);
     if (!raw) return this.fallback.decide(ctx);
     const m = /\{[\s\S]*\}/.exec(raw);
     if (!m) return this.fallback.decide(ctx);
     try {
-      const parsed = JSON.parse(m[0]) as { action?: string; rationale?: string };
+      const parsed = JSON.parse(m[0]) as { action?: string; style?: string; rationale?: string };
       const action = ACTIONS.includes(parsed.action as (typeof ACTIONS)[number])
         ? (parsed.action as MindDecision["action"])
         : "engage";
-      return { action, rationale: String(parsed.rationale ?? "vendor call").slice(0, 120) };
+      const style =
+        parsed.style === "evasive" || parsed.style === "balanced" ? parsed.style : undefined;
+      return { action, style, rationale: String(parsed.rationale ?? "vendor call").slice(0, 120) };
     } catch {
       return this.fallback.decide(ctx);
     }

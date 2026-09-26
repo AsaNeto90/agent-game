@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { elementMultiplier, rangeBandOf } from "@agent-game/shared";
-import { applyScript, rng, spawnWave, tickWorld, type WorldState } from "./world.js";
+import { applyScript, rng, spawnWave, tickWorld, type Fighter, type WorldState } from "./world.js";
 
 describe("element matchups", () => {
   it("fire beats wood, wood resists fire", () => {
@@ -284,5 +284,228 @@ describe("wind-up telegraphs", () => {
     w.fighters[1].hp = 0; // interrupted
     for (let i = 0; i < 3; i++) tickWorld(w, 0.25, "hold", r);
     expect(hits(w)).toHaveLength(0);
+  });
+});
+
+describe("autonomous footwork", () => {
+  const mkFighter = (over: Partial<Fighter>): Fighter => ({
+    id: "x",
+    kind: "virus",
+    name: "X",
+    pos: { x: 0, y: 0, z: 0 },
+    pose: "idle",
+    hp: 40,
+    maxHp: 40,
+    element: "null",
+    cooldown: 0,
+    ...over,
+  });
+
+  it("gives ground when two viruses wind up swings in reach", () => {
+    const w: WorldState = {
+      fighters: [
+        mkFighter({ id: "a", kind: "agent", name: "A.PY", hp: 100, maxHp: 100 }),
+        mkFighter({ id: "v1", pos: { x: 2, y: 0, z: 0 }, windup: 0.5 }),
+        mkFighter({ id: "v2", pos: { x: 2, y: 0, z: 1 }, windup: 0.5 }),
+      ],
+      events: [],
+    };
+    tickWorld(w, 0.25, "engage", rng(3));
+    const a = w.fighters[0];
+    expect(a.pose).toBe("run");
+    expect(a.pos.x).toBeLessThan(0); // stepped away from the pair's centroid
+    expect(w.events.filter((e) => e.type === "hit" && e.attackerId === "a")).toHaveLength(0);
+  });
+
+  it("holds its ground against a single wind-up and punishes it", () => {
+    const w: WorldState = {
+      fighters: [
+        mkFighter({ id: "a", kind: "agent", name: "A.PY", hp: 100, maxHp: 100 }),
+        mkFighter({ id: "v1", pos: { x: 1, y: 0, z: 0 }, windup: 0.5 }),
+      ],
+      events: [],
+    };
+    tickWorld(w, 0.25, "engage", rng(3));
+    expect(w.fighters[0].pose).toBe("melee_attack");
+  });
+});
+
+describe("operator nudge", () => {
+  const mkAgent = (over = {}): Fighter => ({
+    id: "a",
+    kind: "agent",
+    name: "A.PY",
+    pos: { x: 0, y: 0, z: 0 },
+    pose: "idle",
+    hp: 100,
+    maxHp: 100,
+    element: "null",
+    cooldown: 0,
+    ...over,
+  });
+  const mkVirus = (over = {}): Fighter => ({
+    id: "v",
+    kind: "virus",
+    name: "V",
+    pos: { x: 10, y: 0, z: 0 },
+    pose: "idle",
+    hp: 40,
+    maxHp: 40,
+    element: "null",
+    cooldown: 0,
+    ...over,
+  });
+
+  it("steps right on a move nudge", () => {
+    const w: WorldState = { fighters: [mkAgent(), mkVirus()], events: [] };
+    tickWorld(w, 0.25, "engage", rng(1), null, { move: { dx: 1, dz: 0, dash: false } });
+    expect(w.fighters[0].pos.x).toBeGreaterThan(0);
+    expect(w.fighters[0].pose).toBe("run");
+  });
+
+  it("a jump dodges a melee swing", () => {
+    const w: WorldState = {
+      fighters: [mkAgent(), mkVirus({ pos: { x: 1, y: 0, z: 0 }, windup: 0.1, cooldown: 0 })],
+      events: [],
+    };
+    // The virus is mid-swing; the agent jumps the exact tick it lands.
+    tickWorld(w, 0.25, "engage", rng(1), null, { jump: true });
+    expect(w.fighters[0].hp).toBe(100); // whiffed — leapt clean over it
+    expect(w.fighters[0].pos.y).toBeGreaterThan(0);
+    expect(w.fighters[0].pose).toBe("jump");
+  });
+
+  it("the jump lands back at y=0", () => {
+    const w: WorldState = { fighters: [mkAgent({ airborne: 0.6, pos: { x: 0, y: 1, z: 0 } }), mkVirus()], events: [] };
+    for (let i = 0; i < 4; i++) tickWorld(w, 0.25, "engage", rng(1));
+    expect(w.fighters[0].pos.y).toBe(0);
+    expect(w.fighters[0].airborne ?? 0).toBeLessThanOrEqual(0);
+  });
+});
+
+describe("fight styles", () => {
+  const mkFighter = (over: Partial<Fighter>): Fighter => ({
+    id: "x",
+    kind: "virus",
+    name: "X",
+    pos: { x: 0, y: 0, z: 0 },
+    pose: "idle",
+    hp: 40,
+    maxHp: 40,
+    element: "null",
+    cooldown: 0,
+    ...over,
+  });
+
+  it("evasive style leaps a swing that's about to land and takes no damage", () => {
+    const w: WorldState = {
+      fighters: [
+        mkFighter({ id: "a", kind: "agent", name: "A.PY", hp: 100, maxHp: 100 }),
+        mkFighter({ id: "v1", pos: { x: 1.5, y: 0, z: 0 }, windup: 0.4 }),
+      ],
+      events: [],
+      style: "evasive",
+    };
+    tickWorld(w, 0.25, "engage", rng(3));
+    expect(w.fighters[0].pose).toBe("jump");
+    expect((w.fighters[0].airborne ?? 0)).toBeGreaterThan(0);
+    // The swing completes on the second tick — the agent is still airborne, so it whiffs.
+    tickWorld(w, 0.25, "engage", rng(3));
+    expect(w.fighters[0].hp).toBe(100);
+  });
+
+  it("balanced style eats that same swing", () => {
+    const w: WorldState = {
+      fighters: [
+        mkFighter({ id: "a", kind: "agent", name: "A.PY", hp: 100, maxHp: 100 }),
+        mkFighter({ id: "v1", pos: { x: 1.5, y: 0, z: 0 }, windup: 0.4 }),
+      ],
+      events: [],
+      style: "balanced",
+    };
+    tickWorld(w, 0.25, "engage", rng(3));
+    tickWorld(w, 0.25, "engage", rng(3));
+    expect(w.fighters[0].hp).toBeLessThan(100);
+  });
+
+  it("evasive style gives ground to a single wind-up; balanced holds", () => {
+    const mkWorld = (style: "evasive" | "balanced"): WorldState => ({
+      fighters: [
+        mkFighter({ id: "a", kind: "agent", name: "A.PY", hp: 100, maxHp: 100 }),
+        mkFighter({ id: "v1", pos: { x: 2, y: 0, z: 0 }, windup: 0.7 }),
+      ],
+      events: [],
+      style,
+    });
+    const evasiveW = mkWorld("evasive");
+    tickWorld(evasiveW, 0.25, "engage", rng(3));
+    expect(evasiveW.fighters[0].pose).toBe("dash");
+    expect(evasiveW.fighters[0].pos.x).toBeLessThan(0);
+    const balancedW = mkWorld("balanced");
+    tickWorld(balancedW, 0.25, "engage", rng(3));
+    expect(balancedW.fighters[0].pose).toBe("melee_attack");
+  });
+
+  it("style defaults to balanced when unset", () => {
+    const w: WorldState = {
+      fighters: [
+        mkFighter({ id: "a", kind: "agent", name: "A.PY", hp: 100, maxHp: 100 }),
+        mkFighter({ id: "v1", pos: { x: 2, y: 0, z: 0 }, windup: 0.7 }),
+      ],
+      events: [],
+    };
+    tickWorld(w, 0.25, "engage", rng(3));
+    expect(w.fighters[0].pose).toBe("melee_attack");
+  });
+});
+
+describe("orbit nudge", () => {
+  const mkWorld = (): WorldState => ({
+    fighters: [
+      {
+        id: "a",
+        kind: "agent",
+        name: "Test.PY",
+        pos: { x: 6, y: 0, z: 0 },
+        pose: "idle",
+        hp: 100,
+        maxHp: 100,
+        element: "null",
+        cooldown: 99, // don't swing — isolate the movement
+      },
+      {
+        id: "v",
+        kind: "virus",
+        name: "v",
+        pos: { x: 0, y: 0, z: 0 },
+        pose: "idle",
+        hp: 40,
+        maxHp: 40,
+        element: "aqua",
+        cooldown: 99,
+      },
+    ],
+    events: [],
+  });
+
+  it("moves tangentially around the threat, holding distance", () => {
+    const world = mkWorld();
+    const rand = rng(1);
+    // Agent at +x of the virus: tangent should push it toward +z, not inward.
+    tickWorld(world, 0.25, "hold", rand, null, {
+      move: { dx: 0, dz: 0, dash: false, orbit: true },
+    });
+    const agent = world.fighters[0];
+    expect(agent.pos.z).toBeGreaterThan(0.5); // moved laterally
+    expect(Math.abs(agent.pos.x - 6)).toBeLessThan(0.5); // distance held
+  });
+
+  it("a dash orbit moves faster", () => {
+    const slow = mkWorld();
+    const fast = mkWorld();
+    const rand = rng(1);
+    tickWorld(slow, 0.25, "hold", rand, null, { move: { dx: 0, dz: 0, dash: false, orbit: true } });
+    tickWorld(fast, 0.25, "hold", rand, null, { move: { dx: 0, dz: 0, dash: true, orbit: true } });
+    expect(fast.fighters[0].pos.z).toBeGreaterThan(slow.fighters[0].pos.z);
   });
 });

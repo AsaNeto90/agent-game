@@ -14,11 +14,28 @@ export interface MindContext {
   bondTier: string;
   recentMemories: string[];
   situation: string; // compact world summary, e.g. "2 aqua viruses at mid range, hp 70%"
+  /** Rich tactical snapshot for decide(): per-virus hp/band/windup, agent hp/band, style. */
+  tactics?: string;
+  /** The operator's recent words — lets the mind honor casual requests
+   *  ("be careful", "go aggressive") with no keyword parsing needed. */
+  operatorLines?: string[];
 }
 
 export interface MindDecision {
   /** Semantic action for the world sim — never raw coordinates. */
-  action: "engage" | "disengage" | "hold" | "focus_weakest" | "protect";
+  action:
+    | "engage"
+    | "disengage"
+    | "hold"
+    | "focus_weakest"
+    | "protect"
+    | "dodge"
+    | "jump"
+    | "orbit"
+    | "strafe";
+  /** Persistent stance the mind adopts for itself — the loop ignores it
+   *  while the operator holds the style lock. */
+  style?: "evasive" | "balanced";
   rationale: string;
 }
 
@@ -41,14 +58,47 @@ export class MockMind implements MindProvider {
 
   async decide(ctx: MindContext): Promise<MindDecision> {
     this.n++;
-    // Simple, legible policy: hurt -> disengage, outnumbered -> focus weakest.
-    if (ctx.situation.includes("hp low")) {
-      return { action: "disengage", rationale: "hp low — kiting to recover" };
+    // Reads the tactical snapshot like a vendor would: survival first,
+    // then imminent swings, then repositioning, then pack tactics.
+    // Tactics format: "w2 | 3v: aqua40 melee SWING!, null25 mid WINDUP | agent 70% melee | style balanced"
+    const t = ctx.tactics ?? ctx.situation;
+    const hp = /agent (\d+)%/.exec(t);
+    const agentHp = hp ? parseInt(hp[1], 10) : 100;
+    const swings = (t.match(/SWING!/g) ?? []).length; // landing within ~0.5s
+    const windups = (t.match(/WINDUP/g) ?? []).length; // telegraphing, >0.5s out
+    const viruses = parseInt(/(\d+)v:/.exec(t)?.[1] ?? "1", 10);
+    const style = /style (evasive|balanced)/.exec(t)?.[1];
+    const lines = (ctx.operatorLines ?? []).join(" ").toLowerCase();
+
+    // The operator asked to circle them — keep pivoting, don't retreat.
+    // An explicit movement request beats the tactical read, every time.
+    if (/pivot|orbit|around them|around him|around it|circles? around/.test(lines)) {
+      return { action: "orbit", rationale: "pivoting around them, operator" };
     }
-    if (ctx.situation.includes("2+") || ctx.situation.includes("3")) {
+    // Hurt -> disengage and go evasive on your own. No keyword required.
+    if (agentHp < 35) {
+      return { action: "disengage", style: "evasive", rationale: "hurt — going evasive" };
+    }
+    // A swing about to land in melee -> leap it.
+    if (swings > 0 && /agent \d+% melee/.test(t)) {
+      return { action: "jump", rationale: "leaping the swing" };
+    }
+    // One swing telegraphing in melee — sidestep it without giving ground.
+    if (swings === 0 && windups === 1 && /agent \d+% melee/.test(t)) {
+      return { action: "strafe", rationale: "sidestepping the swing" };
+    }
+    // Multiple telegraphs -> reposition before they converge.
+    if (windups >= 2) {
+      return { action: "dodge", rationale: "too many swings — repositioning" };
+    }
+    // Recovered -> drop the evasive stance you adopted yourself.
+    if (style === "evasive" && agentHp > 60) {
+      return { action: "engage", style: "balanced", rationale: "patched up — pressing again" };
+    }
+    if (viruses >= 3) {
       return { action: "focus_weakest", rationale: "outnumbered — thinning the pack" };
     }
-    return { action: "engage", rationale: "single target — closing to melee" };
+    return { action: "engage", rationale: "on the nearest threat" };
   }
 
   async speak(ctx: MindContext, prompt: string): Promise<string> {

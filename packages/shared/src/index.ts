@@ -130,6 +130,7 @@ export const Pose = z.enum([
   "cast",
   "hit",
   "dodge",
+  "jump",
   "down",
   "victory",
 ]);
@@ -160,6 +161,7 @@ export const BrainEvent = z.discriminatedUnion("type", [
   z.object({ type: z.literal("synchro_changed"), value: z.number() }),
   z.object({ type: z.literal("bond_changed"), xp: z.number(), tier: BondTier }),
   z.object({ type: z.literal("energy_changed"), value: z.number() }),
+  z.object({ type: z.literal("down"), fighterId: z.string() }),
   z.object({ type: z.literal("digest"), text: z.string() }),
 ]);
 export type BrainEvent = z.infer<typeof BrainEvent>;

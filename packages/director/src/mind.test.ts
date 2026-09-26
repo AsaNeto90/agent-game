@@ -56,3 +56,83 @@ describe("MockMind.speak answers in context", () => {
     expect(pack).not.toMatch(/Did you see that last one|Reading you loud and clear/);
   });
 });
+
+describe("MockMind.decide reads the tactical snapshot", () => {
+  const mind = new MockMind();
+  const tctx = (tactics: string): MindContext => ({
+    agentName: "AstroMan",
+    agentExt: "PY",
+    bondTier: "spark",
+    recentMemories: [],
+    situation: "fighting",
+    tactics,
+  });
+
+  it("goes evasive and disengages on its own when hurt", async () => {
+    const d = await mind.decide(tctx("w2 | 2v: aqua40 melee, null25 mid | agent 20% melee | style balanced"));
+    expect(d.action).toBe("disengage");
+    expect(d.style).toBe("evasive");
+  });
+
+  it("leaps a swing about to land in melee", async () => {
+    const d = await mind.decide(tctx("w2 | 1v: aqua40 melee SWING! | agent 80% melee | style balanced"));
+    expect(d.action).toBe("jump");
+  });
+
+  it("repositions when multiple viruses telegraph at once", async () => {
+    const d = await mind.decide(
+      tctx("w2 | 3v: aqua40 melee WINDUP, null25 mid WINDUP, fire40 far | agent 80% mid | style balanced"),
+    );
+    expect(d.action).toBe("dodge");
+  });
+
+  it("drops the evasive stance it adopted once recovered", async () => {
+    const d = await mind.decide(tctx("w2 | 1v: aqua40 mid | agent 70% mid | style evasive"));
+    expect(d.action).toBe("engage");
+    expect(d.style).toBe("balanced");
+  });
+
+  it("thins the pack when outnumbered", async () => {
+    const d = await mind.decide(
+      tctx("w3 | 4v: aqua40 far, null25 far, fire40 far, elec40 far | agent 90% far | style balanced"),
+    );
+    expect(d.action).toBe("focus_weakest");
+  });
+
+  it("engages by default", async () => {
+    const d = await mind.decide(tctx("w1 | 1v: aqua40 mid | agent 100% mid | style balanced"));
+    expect(d.action).toBe("engage");
+  });
+});
+
+describe("MockMind.decide lateral movement", () => {
+  const mind = new MockMind();
+  const tctx = (tactics: string, operatorLines: string[] = []): MindContext => ({
+    agentName: "AstroMan",
+    agentExt: "PY",
+    bondTier: "spark",
+    recentMemories: [],
+    situation: "fighting",
+    tactics,
+    operatorLines,
+  });
+
+  it("keeps pivoting when the operator asked to circle them", async () => {
+    const d = await mind.decide(
+      tctx("w2 | 3v: aqua40 melee WINDUP, null25 melee WINDUP | agent 80% melee | style balanced", [
+        "try pivoting around them in circles",
+      ]),
+    );
+    expect(d.action).toBe("orbit");
+  });
+
+  it("sidesteps a single telegraphed swing without retreating", async () => {
+    const d = await mind.decide(tctx("w2 | 1v: aqua40 melee WINDUP | agent 80% melee | style balanced"));
+    expect(d.action).toBe("strafe");
+  });
+
+  it("still leaps the swing that's about to land", async () => {
+    const d = await mind.decide(tctx("w2 | 1v: aqua40 melee SWING! | agent 80% melee | style balanced"));
+    expect(d.action).toBe("jump");
+  });
+});

@@ -21,10 +21,13 @@ const ELEMENT_COLORS: Record<string, number> = {
  * Subscribes to the Convex snapshot (4Hz semantic state) and interpolates
  * to 60fps. Poses drive simple procedural animation.
  */
-function DiveView({ sessionId }: { sessionId: Id<"sessions"> }) {
+function DiveView({ sessionId, followCam }: { sessionId: Id<"sessions">; followCam: boolean }) {
   const mountRef = useRef<HTMLDivElement>(null);
   const snapshot = useQuery(api.session.snapshot, { sessionId });
   const meshes = useRef(new Map<string, THREE.Mesh>());
+  // The animate loop runs outside React render — mirror the prop through a ref.
+  const followRef = useRef(followCam);
+  followRef.current = followCam;
 
   useEffect(() => {
     const mount = mountRef.current!;
@@ -49,6 +52,7 @@ function DiveView({ sessionId }: { sessionId: Id<"sessions"> }) {
     scene.add(key);
 
     let raf = 0;
+    const desired = new THREE.Vector3(); // scratch — no per-frame allocation
     const animate = () => {
       raf = requestAnimationFrame(animate);
       // Interpolate every mesh toward its latest snapshot position.
@@ -60,6 +64,17 @@ function DiveView({ sessionId }: { sessionId: Id<"sessions"> }) {
           (mesh.material as THREE.MeshStandardMaterial).emissive.setHex(0xff2222);
         } else {
           (mesh.material as THREE.MeshStandardMaterial).emissive.setHex(0x000000);
+        }
+      }
+      // Follow cam: hover over the agent, looking down at it.
+      if (followRef.current) {
+        for (const [, mesh] of meshes.current) {
+          if (mesh.userData.kind === "agent") {
+            desired.set(mesh.position.x, mesh.position.y + 9, mesh.position.z + 13);
+            camera.position.lerp(desired, 0.07);
+            camera.lookAt(mesh.position.x, mesh.position.y + 1, mesh.position.z);
+            break;
+          }
         }
       }
       renderer.render(scene, camera);
@@ -106,12 +121,13 @@ function DiveView({ sessionId }: { sessionId: Id<"sessions"> }) {
             metalness: 0.6,
           }),
         );
-        mesh.position.set(e.position.x, 1, e.position.z);
+        mesh.position.set(e.position.x, 1 + e.position.y, e.position.z);
         scene.add(mesh);
         meshes.current.set(e.id, mesh);
       }
-      mesh.userData.target = new THREE.Vector3(e.position.x, 1, e.position.z);
+      mesh.userData.target = new THREE.Vector3(e.position.x, 1 + e.position.y, e.position.z);
       mesh.userData.pose = e.pose;
+      mesh.userData.kind = e.kind;
       const s = e.hp / e.maxHp;
       mesh.scale.setScalar(0.6 + 0.4 * Math.max(0.05, s));
     }
@@ -127,7 +143,15 @@ function DiveView({ sessionId }: { sessionId: Id<"sessions"> }) {
 }
 
 /** HUD — the operator's verb set: command, slot scripts, chat, vitals. */
-function Hud({ sessionId }: { sessionId: Id<"sessions"> }) {
+function Hud({
+  sessionId,
+  followCam,
+  onToggleFollow,
+}: {
+  sessionId: Id<"sessions">;
+  followCam: boolean;
+  onToggleFollow: () => void;
+}) {
   const sendIntent = useMutation(api.session.sendIntent);
   const snapshot = useQuery(api.session.snapshot, { sessionId });
   const [command, setCommand] = useState("");
@@ -171,6 +195,12 @@ function Hud({ sessionId }: { sessionId: Id<"sessions"> }) {
         return (
           <div key={i} style={{ color: "#ff8a8a" }}>
             💥 {prettyId(e.attackerId)} → {prettyId(e.targetId)} · {e.damage}
+          </div>
+        );
+      case "down":
+        return (
+          <div key={i} style={{ color: "#b0b0b0" }}>
+            ☠ {prettyId(e.fighterId)} deleted
           </div>
         );
       case "bond_changed":
@@ -222,6 +252,23 @@ function Hud({ sessionId }: { sessionId: Id<"sessions"> }) {
             ⚡ {s}
           </button>
         ))}
+        <button
+          onClick={() => send("command", { text: "next wave" })}
+          style={{ borderColor: "#7dff9a", color: "#7dff9a" }}
+        >
+          ▸ Next wave
+        </button>
+        <button
+          onClick={onToggleFollow}
+          style={
+            followCam
+              ? { borderColor: "#8ad8ff", color: "#8ad8ff" }
+              : { opacity: 0.5 }
+          }
+          title="Lock the camera over your agent"
+        >
+          🎥 {followCam ? "Following" : "Free cam"}
+        </button>
       </div>
 
       <form
@@ -317,6 +364,7 @@ function DiveConsole({ diveId, onReset }: { diveId: string; onReset: () => void 
 
 function DiveScreen({ sessionId }: { sessionId: Id<"sessions"> }) {
   const snapshot = useQuery(api.session.snapshot, { sessionId });
+  const [followCam, setFollowCam] = useState(true);
 
   if (snapshot && snapshot.status !== "active") {
     return (
@@ -342,10 +390,14 @@ function DiveScreen({ sessionId }: { sessionId: Id<"sessions"> }) {
       }}
     >
       <div style={{ flex: 3 }}>
-        <DiveView sessionId={sessionId} />
+        <DiveView sessionId={sessionId} followCam={followCam} />
       </div>
       <div style={{ flex: 1, borderLeft: "1px solid #1a3a5c", minWidth: 300 }}>
-        <Hud sessionId={sessionId} />
+        <Hud
+          sessionId={sessionId}
+          followCam={followCam}
+          onToggleFollow={() => setFollowCam((f) => !f)}
+        />
       </div>
     </div>
   );

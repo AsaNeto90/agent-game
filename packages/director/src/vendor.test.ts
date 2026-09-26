@@ -184,3 +184,52 @@ describe("MIND_TIMEOUT_MS", () => {
     });
   });
 });
+
+describe("VendorMind.decide autonomy", () => {
+  it("parses the style field the mind sets for itself", async () => {
+    const fetchFn = fakeFetch(chatBody('{"action": "disengage", "style": "evasive", "rationale": "hurt, kiting"}'));
+    const d = await new VendorMind(opts(fetchFn)).decide(ctx);
+    expect(d.action).toBe("disengage");
+    expect(d.style).toBe("evasive");
+  });
+
+  it("drops invalid style values instead of crashing", async () => {
+    const fetchFn = fakeFetch(chatBody('{"action": "jump", "style": "reckless", "rationale": "yolo"}'));
+    const d = await new VendorMind(opts(fetchFn)).decide(ctx);
+    expect(d.action).toBe("jump");
+    expect(d.style).toBeUndefined();
+  });
+
+  it("accepts the new dodge and jump actions", async () => {
+    const d = await new VendorMind(opts(fakeFetch(chatBody('{"action": "dodge", "rationale": "repositioning"}')))).decide(ctx);
+    expect(d.action).toBe("dodge");
+  });
+
+  it("sends the tactical snapshot and operator lines to the vendor", async () => {
+    const fetchFn = fakeFetch(chatBody('{"action": "engage", "rationale": "ok"}'));
+    const mind = new VendorMind(opts(fetchFn));
+    await mind.decide({
+      ...ctx,
+      tactics: "w2 | 1v: aqua40 melee | agent 80% melee | style balanced",
+      operatorLines: ["be careful out there"],
+    });
+    const [, init] = (fetchFn.mock.calls as unknown as [string, RequestInit][])[0];
+    const body = JSON.parse(init.body as string);
+    const userMsg = body.messages.find((m: { role: string }) => m.role === "user").content as string;
+    expect(userMsg).toContain("aqua40 melee");
+    expect(userMsg).toContain("be careful out there");
+  });
+});
+
+describe("VendorMind.decide lateral moves", () => {
+  it("accepts orbit and strafe actions", async () => {
+    const orbit = await new VendorMind(
+      opts(fakeFetch(chatBody('{"action": "orbit", "rationale": "pivoting"}'))),
+    ).decide(ctx);
+    expect(orbit.action).toBe("orbit");
+    const strafe = await new VendorMind(
+      opts(fakeFetch(chatBody('{"action": "strafe", "rationale": "sidestep"}'))),
+    ).decide(ctx);
+    expect(strafe.action).toBe("strafe");
+  });
+});

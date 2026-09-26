@@ -5,12 +5,286 @@
 import { ConvexHttpClient } from "convex/browser";
 import { api } from "../../../convex/_generated/api.js";
 import type { Id } from "../../../convex/_generated/dataModel.js";
-import { MockMind, estimateCostUsd, type MindProvider } from "./mind.js";
-import { applyScript, rng, spawnWave, tickWorld, type Fighter, type WorldState } from "./world.js";
-import type { Element } from "@agent-game/shared";
+import { MockMind, estimateCostUsd, type MindDecision, type MindProvider } from "./mind.js";
+import {
+  applyScript,
+  rng,
+  spawnWave,
+  tickWorld,
+  type Fighter,
+  type FightStyle,
+  type WorldState,
+} from "./world.js";
+import { rangeBandOf, type Element } from "@agent-game/shared";
 
 const TICK_MS = 250;
 const ENERGY_DRAIN_PER_TICK = 0.08; // ~100 energy ≈ 5 min of diving
+
+/**
+ * A single movement primitive the agent can perform. Steps are camera-relative
+ * (the camera never rotates: right = +x, forward = -z, away from the camera).
+ */
+export interface MovePrimitive {
+  kind: "step" | "circle" | "jump" | "orbit";
+  dx: number;
+  dz: number;
+  dash: boolean;
+  /** dash directly away from the nearest virus ("dodge!" with no direction) */
+  flee?: boolean;
+  turns: number;
+  secs: number;
+}
+
+/** Words that already mean something tactical — they win over movement parsing. */
+const TACTICAL_RE =
+  /retreat|fall back|disengage|hold|wait|steady|focus|weakest|thin|protect|guard|cover|attack|hit|flank/;
+
+/**
+ * Parse a freeform movement command into an executable primitive queue.
+ * "do 3 circles and jump" -> [circle x3, jump]. "go right then dodge left"
+ * -> [step right, dash left]. Returns [] when nothing movement-like is found.
+ */
+export function parseMoveSequence(text: string): MovePrimitive[] {
+  const clauses = text.toLowerCase().split(/\bthen\b|\band\b|,|;/);
+  const out: MovePrimitive[] = [];
+  for (const raw of clauses) {
+    const c = raw.trim();
+    if (!c) continue;
+    // "pivot around them", "orbit the virus" — circle the ENEMY, not yourself.
+    // Plain "do 3 circles" stays a circle in place (the acrobatic kind).
+    if (
+      /\bpivot\w*|\borbit\w*/.test(c) ||
+      (/\baround\b/.test(c) && /\b(them|him|it|viruses?|enemy|enemies)\b/.test(c))
+    ) {
+      const n = c.match(/(\d+)\s*(times?|circles?|loops?|orbits?)/);
+      const turns = Math.min(
+        n ? parseInt(n[1], 10) : /\btwice\b|two times/.test(c) ? 2 : 1,
+        3,
+      );
+      out.push({
+        kind: "orbit",
+        dx: 0,
+        dz: 0,
+        dash: /\bdash\b|\bquick\b/.test(c),
+        turns,
+        secs: 3 * turns,
+      });
+      continue;
+    }
+    const circleMatch = c.match(/(\d+)?\s*(circles?|spins?|loops?)/);
+    if (circleMatch || /\bspin\b/.test(c)) {
+      const turns = Math.min(circleMatch?.[1] ? parseInt(circleMatch[1], 10) : 1, 5);
+      out.push({ kind: "circle", dx: 0, dz: 0, dash: false, turns, secs: 1.2 * turns });
+      continue;
+    }
+    if (/\bjump\b|\bhop\b/.test(c)) {
+      const n = /\btwice\b|two times|x ?2/.test(c) ? 2 : 1;
+      for (let i = 0; i < n; i++)
+        out.push({ kind: "jump", dx: 0, dz: 0, dash: false, turns: 0, secs: 0.75 });
+      continue;
+    }
+    let dx = 0;
+    let dz = 0;
+    if (/\bright\b/.test(c)) dx += 1;
+    if (/\bleft\b/.test(c)) dx -= 1;
+    if (/\bforward\b|\badvance\b|push (forward|up)|\bmove up\b/.test(c)) dz -= 1;
+    if (/\bback\b/.test(c)) dz += 1;
+    const dash = /\bdodge\b|\bdash\b|\bquick/.test(c);
+    // "dodge!" with no direction = dash away from the nearest virus.
+    if (dx === 0 && dz === 0) {
+      if (!dash) continue;
+      out.push({ kind: "step", dx: 0, dz: 0, dash: true, flee: true, turns: 0, secs: 0.75 });
+      continue;
+    }
+    const l = Math.hypot(dx, dz);
+    out.push({ kind: "step", dx: dx / l, dz: dz / l, dash, turns: 0, secs: dash ? 0.75 : 1.5 });
+  }
+  return out;
+}
+
+/**
+ * Standing fight-style requests: "incorporate some jumps", "dodge more",
+ * "fight evasive" -> the agent dodges on its own until told otherwise.
+ * "fight normal" / "go aggressive" -> back to balanced.
+ */
+export function parseFightStyle(text: string): "evasive" | "balanced" | null {
+  const t = text.toLowerCase();
+  if (/evasive|dodge more|defensive|play it safe|incorporat\w* (some )?jumps?/.test(t)) return "evasive";
+  if (/aggressive|all ?out|stop dodging|fight normal|balanced/.test(t)) return "balanced";
+  return null;
+}
+
+export function isTacticalCommand(text: string): boolean {
+  return TACTICAL_RE.test(text.toLowerCase());
+}
+
+function describePrimitive(p: MovePrimitive): string {
+  if (p.kind === "jump") return "jump";
+  if (p.kind === "circle") return p.turns === 1 ? "circle" : `${p.turns} circles`;
+  if (p.kind === "orbit") return p.dash ? "quick pivot around them" : "pivot around them";
+  if (p.flee) return "dodge away";
+  const dir = p.dx > 0.5 ? "right" : p.dx < -0.5 ? "left" : p.dz > 0.5 ? "back" : "forward";
+  return `${p.dash ? "dash" : "step"} ${dir}`;
+}
+
+interface QueuedMove extends MovePrimitive {
+  startedAt: number;
+  until: number;
+}
+
+/**
+ * Translate the queue's head step into this tick's sim nudge. Pure — tested.
+ */
+export function nudgeForStep(
+  step: QueuedMove | null,
+  tick: number,
+): {
+  move: { dx: number; dz: number; dash: boolean; flee?: boolean; orbit?: boolean } | null;
+  jump: boolean;
+} {
+  if (!step) return { move: null, jump: false };
+  if (step.kind === "jump") return { move: null, jump: true };
+  if (step.kind === "orbit")
+    return { move: { dx: 0, dz: 0, dash: step.dash, orbit: true }, jump: false };
+  if (step.kind === "circle") {
+    const span = Math.max(1, step.until - step.startedAt);
+    const a = (2 * Math.PI * step.turns * (tick - step.startedAt)) / span;
+    return { move: { dx: Math.cos(a), dz: Math.sin(a), dash: false }, jump: false };
+  }
+  return { move: { dx: step.dx, dz: step.dz, dash: step.dash, flee: step.flee }, jump: false };
+}
+
+/**
+ * Phrases that tell the agent to start the next wave. Only honored while
+ * resting between waves — mid-fight they're just coaching words.
+ */
+export function isReadyCommand(text: string): boolean {
+  return /next wave|ready|bring (it|them) on|send them/i.test(text);
+}
+
+/**
+ * Maneuvers are temporary orders — the agent executes, then resumes its own
+ * judgment. Stances (engage/hold/protect) persist until countermanded.
+ * Returns the tick the maneuver expires, or null for stances.
+ */
+export function maneuverExpiry(
+  directive: "engage" | "disengage" | "hold" | "focus_weakest" | "protect",
+  tick: number,
+): number | null {
+  if (directive === "disengage") return tick + 16; // 4s of giving ground
+  if (directive === "focus_weakest") return tick + 24; // 6s of focused fire
+  return null;
+}
+
+/**
+ * Corpses linger 4 ticks (1s) in the "down" pose so the death reads, then
+ * vanish from the snapshot — no more standing corpses confusing the operator.
+ */
+export function visibleFighters(
+  fighters: Fighter[],
+  downAt: Map<string, number>,
+  tick: number,
+): Fighter[] {
+  return fighters.filter((f) => f.hp > 0 || tick - (downAt.get(f.id) ?? -100) < 4);
+}
+
+/**
+ * Compact tactical snapshot for the mind's decide() — cheap enough to send
+ * every few seconds, rich enough to actually fight on.
+ * Format: "w2 | 3v: aqua40 melee SWING!, null25 mid WINDUP | agent 70% melee | style balanced"
+ * SWING! = a swing landing within ~0.5s. WINDUP = telegraphing, >0.5s out.
+ */
+export function tacticalSituation(world: WorldState, wave: number): string {
+  const agent = world.fighters.find((f) => f.kind === "agent");
+  if (!agent) return `w${wave} | agent down`;
+  const dist2d = (a: { x: number; z: number }, b: { x: number; z: number }) =>
+    Math.hypot(a.x - b.x, a.z - b.z);
+  const viruses = world.fighters.filter((f) => f.kind === "virus" && f.hp > 0);
+  const parts = viruses.map((v) => {
+    const band = rangeBandOf(dist2d(agent.pos, v.pos));
+    const w = v.windup ?? 0;
+    const mark = w > 0.5 ? " WINDUP" : w > 0 ? " SWING!" : "";
+    return `${v.element}${v.hp} ${band}${mark}`;
+  });
+  const nearest = viruses.length
+    ? rangeBandOf(Math.min(...viruses.map((v) => dist2d(agent.pos, v.pos))))
+    : "far";
+  const agentHp = Math.round((agent.hp / agent.maxHp) * 100);
+  return `w${wave} | ${viruses.length}v: ${parts.join(", ")} | agent ${agentHp}% ${nearest} | style ${world.style ?? "balanced"}`;
+}
+
+/** How the mind's decisions reach the sim — same primitives the operator uses. */
+export interface MindActuators {
+  /** Enqueue a one-shot impulse (dodge/jump). */
+  queue: (seq: MovePrimitive[], tick: number) => void;
+  /** Set a temporary maneuver — same machinery as operator orders. */
+  maneuver: (
+    d: "engage" | "disengage" | "hold" | "focus_weakest" | "protect",
+    untilTick: number,
+  ) => void;
+  /** Flip the persistent fight style. */
+  setStyle: (s: FightStyle) => void;
+}
+
+/** Mind maneuvers last 4s — the mind reassesses on its own cadence anyway. */
+export const MIND_MANEUVER_TICKS = 16;
+
+/**
+ * Apply the mind's autonomous decision to the sim. Returns a short summary
+ * for the flight recorder. Stances become temporary maneuvers; dodge/jump
+ * are one-shot impulses; style flips the persistent stance unless the
+ * operator locked it with their own word.
+ */
+export function applyMindDecision(
+  world: WorldState,
+  decision: MindDecision,
+  tick: number,
+  act: MindActuators,
+  opts: { styleLocked: boolean; queueBusy: boolean },
+): string {
+  const done: string[] = [];
+  const a = decision.action;
+  if (a === "dodge") {
+    if (!opts.queueBusy) {
+      act.queue([{ kind: "step", dx: 0, dz: 0, dash: true, flee: true, turns: 0, secs: 0.75 }], tick);
+      done.push("dodge");
+    } else {
+      done.push("dodge(skipped: operator moving)");
+    }
+  } else if (a === "jump") {
+    if (!opts.queueBusy) {
+      act.queue([{ kind: "jump", dx: 0, dz: 0, dash: false, turns: 0, secs: 0 }], tick);
+      done.push("jump");
+    } else {
+      done.push("jump(skipped: operator moving)");
+    }
+  } else if (a === "orbit") {
+    // Pivot around the nearest threat for ~3s, holding distance.
+    if (!opts.queueBusy) {
+      act.queue([{ kind: "orbit", dx: 0, dz: 0, dash: false, turns: 0, secs: 3 }], tick);
+      done.push("orbit");
+    } else {
+      done.push("orbit(skipped: operator moving)");
+    }
+  } else if (a === "strafe") {
+    // A strafe is a quick lateral dash around the threat — same orbit
+    // machinery, short and fast: sidestep without giving ground.
+    if (!opts.queueBusy) {
+      act.queue([{ kind: "orbit", dx: 0, dz: 0, dash: true, turns: 0, secs: 0.75 }], tick);
+      done.push("strafe");
+    } else {
+      done.push("strafe(skipped: operator moving)");
+    }
+  } else {
+    act.maneuver(a, tick + MIND_MANEUVER_TICKS);
+    done.push(`maneuver:${a}`);
+  }
+  if (decision.style && !opts.styleLocked && decision.style !== (world.style ?? "balanced")) {
+    act.setStyle(decision.style);
+    done.push(`style:${decision.style}`);
+  }
+  return done.join(" ");
+}
 
 interface DirectorConfig {
   convexUrl: string;
@@ -79,10 +353,36 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
   let energy = agent.energy;
   let synchro = 50;
   let directive: "engage" | "disengage" | "hold" | "focus_weakest" | "protect" = "engage";
+  let directiveUntil: number | null = null; // tick when a temporary maneuver expires
+  let directiveSource: "operator" | "mind" | null = null; // whose judgment currently steers
+  let styleByOperator = false; // the operator's word on style is law — the mind won't touch it
+  let decideInFlight = false; // one decide() at a time — a slow vendor must not pile up
+  // The operator's recent utterances, for the mind's context — a standing
+  // order ("pivot around them") steers the mind for ~30s, then lapses.
+  const recentOperatorLines: { text: string; tick: number }[] = [];
+  const noteOperatorLine = (text: string) => {
+    const t = text.trim().slice(0, 80);
+    if (!t) return;
+    recentOperatorLines.push({ text: t, tick });
+    while (recentOperatorLines.length > 5) recentOperatorLines.shift();
+  };
+  let moveQueue: QueuedMove[] = []; // conversational movement sequences, in order
+
+  /** Enqueue a parsed movement sequence — steps chain back-to-back. */
+  const queueMoves = (seq: MovePrimitive[], tick: number): void => {
+    let t = tick;
+    moveQueue = seq.map((s) => {
+      const dur = Math.max(1, Math.round(s.secs * 4));
+      const step: QueuedMove = { ...s, startedAt: t, until: t + dur };
+      t += dur;
+      return step;
+    });
+  };
   let targetElement: Element | null = null;
   let lastOperatorTick = -1000; // banter stays quiet right after a conversation
   let wave = 1; // the opening pair is wave 1; clears escalate from here
-  let respawnAt: number | null = null; // tick when the next wave drops
+  let resting = false; // true between waves — the operator's breather to chat and coach
+  const downAt = new Map<string, number>(); // fighterId -> tick it died (corpses linger 1s, then vanish)
   let running = true;
 
   /** Map operator words to a battle directive. */
@@ -192,10 +492,55 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
       const p = intent.payload as Record<string, string>;
       if (intent.type === "command") {
         const text = p.text ?? "";
-        directive = parseDirective(text);
-        targetElement = parseElement(text);
-        synchro = Math.min(100, synchro + 2); // good coaching nudges synchro up
+        // "Next wave" starts the fight again — only meaningful while resting.
+        if (resting && isReadyCommand(text)) {
+          resting = false;
+          wave++;
+          spawnWave(world, wave, rand);
+          const count = Math.min(1 + wave, 6);
+          lastOperatorTick = tick;
+          if (text.trim()) {
+            await convex.mutation(api.session.pushEvent, {
+              sessionId,
+              tick,
+              event: { type: "dialogue", speaker: "OPERATOR", text },
+            });
+          }
+          await convex.mutation(api.session.pushEvent, {
+            sessionId,
+            tick,
+            event: {
+              type: "dialogue",
+              speaker: `${agent.name}.${agent.ext}`,
+              text: `Wave ${wave} incoming — ${count} viruses on the scope. Stay sharp!`,
+            },
+          });
+          await trace("L1", `wave_start:${wave}`, `${count} viruses spawned`, Date.now() - t0);
+          continue;
+        }
+        // Conversational movement wins when the words are movement, not tactics.
+        const seq = parseMoveSequence(text);
+        const moved = seq.length > 0 && !isTacticalCommand(text);
+        if (moved) {
+          queueMoves(seq, tick);
+          synchro = Math.min(100, synchro + 2);
+        } else {
+          directive = parseDirective(text);
+          directiveUntil = maneuverExpiry(directive, tick);
+          directiveSource = "operator";
+          targetElement = parseElement(text);
+          synchro = Math.min(100, synchro + 2); // good coaching nudges synchro up
+        }
+        // Standing fight-style requests ("incorporate some jumps") are
+        // independent of one-shot orders — the agent adopts the style
+        // until told otherwise.
+        const fs = parseFightStyle(text);
+        if (fs) {
+          world.style = fs;
+          styleByOperator = true; // the operator's word on style is law
+        }
         lastOperatorTick = tick;
+        noteOperatorLine(text);
         // The operator's words appear in the feed — a dialogue needs both sides.
         if (text.trim()) {
           await convex.mutation(api.session.pushEvent, {
@@ -205,7 +550,24 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
           });
         }
         // The ack must not block the tick: the world keeps fighting mid-sentence.
-        sayAsync(`operator command: ${text}`, `operator command: ${text}`);
+        // Tell the mind what the words did, so the ack sets the right expectation.
+        const notes: string[] = [];
+        if (moved)
+          notes.push(
+            `movement sequence: ${seq.map(describePrimitive).join(", ")} — the agent performs it, then resumes its own judgment`,
+          );
+        else if (directiveUntil !== null)
+          notes.push(
+            `brief maneuver: the agent does this for a few seconds, then resumes its own judgment`,
+          );
+        if (fs)
+          notes.push(
+            fs === "evasive"
+              ? `fight style: evasive — the agent leaps and dashes around swings on its own until you say "fight normal"`
+              : `fight style: balanced — back to straightforward fighting`,
+          );
+        const maneuverNote = notes.length > 0 ? ` (${notes.join("; ")})` : "";
+        sayAsync(`operator command: ${text}`, `operator command: ${text}${maneuverNote}`);
         await trace("L1", `command:${directive}`, `operator said "${text}"`, Date.now() - t0);
       } else if (intent.type === "slot_script") {
         synchro = Math.min(100, synchro + 4);
@@ -226,16 +588,37 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
       } else if (intent.type === "chat") {
         const text = p.text ?? "";
         // Chat that reads like a command also steers the agent ("hit the acqua").
+        let styled = false; // a fight-style change already got its own ack
         if (
           /retreat|fall back|disengage|hold|wait|steady|focus|weakest|thin|protect|guard|cover|attack|hit|flank/.test(
             text.toLowerCase(),
           )
         ) {
           directive = parseDirective(text);
+          directiveUntil = maneuverExpiry(directive, tick);
+          directiveSource = "operator";
           targetElement = parseElement(text);
           synchro = Math.min(100, synchro + 2);
+        } else {
+          // Pure movement chat ("do 3 circles and jump") — no tactics attached.
+          const seq = parseMoveSequence(text);
+          if (seq.length > 0) {
+            queueMoves(seq, tick);
+            synchro = Math.min(100, synchro + 2);
+          }
+          const fs = parseFightStyle(text);
+          styled = !!fs;
+          if (fs) {
+            world.style = fs;
+            styleByOperator = true; // the operator's word on style is law
+            sayAsync(
+              "mid-dive chat",
+              `${text} (fight style: ${fs}${fs === "evasive" ? " — the agent leaps and dashes around swings on its own until told otherwise" : " — back to straightforward fighting"})`,
+            );
+          }
         }
         lastOperatorTick = tick;
+        noteOperatorLine(text);
         if (text.trim()) {
           await convex.mutation(api.session.pushEvent, {
             sessionId,
@@ -243,7 +626,7 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
             event: { type: "dialogue", speaker: "OPERATOR", text },
           });
         }
-        sayAsync("mid-dive chat", text);
+        if (!styled) sayAsync("mid-dive chat", text);
         await trace("L2", "chat_reply", `responded to operator`, Date.now() - t0);
       }
     }
@@ -253,7 +636,11 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
     const situation = agentF
       ? `${world.fighters.filter((f) => f.kind === "virus" && f.hp > 0).length} viruses, agent hp ${agentF.hp}%${agentF.hp < 30 ? ", hp low" : ""}`
       : "agent down";
-    tickWorld(world, TICK_MS / 1000, directive, rand, targetElement);
+    // 2a2. Movement queue: conversational sequences drive the sim one tick at a time.
+    while (moveQueue.length > 0 && tick >= moveQueue[0].until) moveQueue.shift();
+    const nudge = nudgeForStep(moveQueue[0] ?? null, tick);
+
+    tickWorld(world, TICK_MS / 1000, directive, rand, targetElement, nudge.move || nudge.jump ? nudge : null);
 
     // Drain world events into the Convex feed.
     for (const e of world.events.splice(0)) {
@@ -270,7 +657,22 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
             element: e.element,
           },
         });
+      } else if (e.type === "down") {
+        downAt.set(e.fighterId, tick);
+        await convex.mutation(api.session.pushEvent, {
+          sessionId,
+          tick,
+          event: { type: "down", fighterId: e.fighterId },
+        });
       }
+    }
+
+    // 2a. Maneuver expiry: temporary orders lapse, the agent resumes its own judgment.
+    if (directiveUntil !== null && tick >= directiveUntil) {
+      directive = "engage";
+      directiveUntil = null;
+      directiveSource = null;
+      await trace("L1", "maneuver_expired", "directive reverted to engage", 0);
     }
 
     // 2b. Wave control: clears escalate, death ends the dive.
@@ -293,9 +695,10 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
       setTimeout(() => process.exit(0), 500);
       return;
     }
-    if (virusesAlive === 0 && respawnAt === null) {
-      // Breather: the next wave drops in 5 seconds.
-      respawnAt = tick + 20;
+    if (virusesAlive === 0 && !resting) {
+      // The arena is clear: rest. The next wave waits for the operator —
+      // no timer pressure, and the energy clock pauses while they chat.
+      resting = true;
       const a = world.fighters.find((f) => f.kind === "agent")!;
       a.hp = Math.min(a.maxHp, a.hp + 25); // catch your breath between waves
       synchro = Math.min(100, synchro + 10);
@@ -305,29 +708,95 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
         event: {
           type: "dialogue",
           speaker: `${agent.name}.${agent.ext}`,
-          text: `Wave ${wave} cleared — nice coaching, operator. Catch your breath.`,
+          text: `Wave ${wave} cleared — nice coaching, operator. Catch your breath. Say "next wave" when you're ready.`,
         },
       });
-      await trace("L1", `wave_cleared:${wave}`, `${wave} down, next incoming`, 1);
-    } else if (respawnAt !== null && tick >= respawnAt) {
-      respawnAt = null;
-      wave++;
-      spawnWave(world, wave, rand);
-      const count = Math.min(1 + wave, 6);
-      await convex.mutation(api.session.pushEvent, {
-        sessionId,
-        tick,
-        event: {
-          type: "dialogue",
-          speaker: `${agent.name}.${agent.ext}`,
-          text: `Wave ${wave} incoming — ${count} viruses on the scope. Stay sharp!`,
-        },
-      });
-      await trace("L1", `wave_start:${wave}`, `${count} viruses spawned`, 1);
+      await trace("L1", `wave_cleared:${wave}`, `${wave} down, resting until operator is ready`, 1);
+    }
+
+    // 2c. L1 autonomy: the mind reads the fight and moves on its own.
+    // Every 4s, fire-and-forget — a slow vendor must never stall the 4Hz loop.
+    // The operator's word is law: their fresh commands and maneuvers hold the
+    // floor, and a decision that arrives after they spoke is dropped, not applied.
+    if (
+      !decideInFlight &&
+      !resting &&
+      agentAlive &&
+      virusesAlive > 0 &&
+      tick % 16 === 0 &&
+      tick - lastOperatorTick > 8 &&
+      (directiveUntil === null || directiveSource !== "operator")
+    ) {
+      decideInFlight = true;
+      const seenOperatorTick = lastOperatorTick;
+      const t0d = Date.now();
+      const tactics = tacticalSituation(world, wave);
+      cfg.mind
+        .decide({
+          agentName: agent.name,
+          agentExt: agent.ext,
+          bondTier: agent.bondTier,
+          recentMemories: [],
+          situation,
+          tactics,
+          operatorLines: recentOperatorLines
+            .filter((l) => tick - l.tick < 120)
+            .map((l) => l.text)
+            .slice(-3),
+        })
+        .then(async (d) => {
+          if (lastOperatorTick !== seenOperatorTick) return; // operator spoke mid-thought — their word stands
+          const before = world.style ?? "balanced";
+          const summary = applyMindDecision(
+            world,
+            d,
+            tick,
+            {
+              queue: (seq, t) => queueMoves(seq, t),
+              maneuver: (m, until) => {
+                directive = m;
+                directiveUntil = until;
+                directiveSource = "mind";
+              },
+              setStyle: (s) => {
+                world.style = s;
+              },
+            },
+            { styleLocked: styleByOperator, queueBusy: moveQueue.length > 0 },
+          );
+          await trace(
+            "L1",
+            "mind_decide",
+            `${d.rationale} → ${summary}`,
+            Date.now() - t0d,
+            cfg.mind.lastTokens,
+          );
+          // A style change the mind chose itself is worth announcing —
+          // it's the visible proof the agent thinks for itself.
+          if (before !== (world.style ?? "balanced")) {
+            await convex.mutation(api.session.pushEvent, {
+              sessionId,
+              tick,
+              event: {
+                type: "dialogue",
+                speaker: `${agent.name}.${agent.ext}`,
+                text:
+                  world.style === "evasive"
+                    ? `Going evasive — ${d.rationale}.`
+                    : `Back to balanced — ${d.rationale}.`,
+              },
+            });
+          }
+        })
+        .catch(() => {})
+        .finally(() => {
+          decideInFlight = false;
+        });
     }
 
     // 3. Energy — the fiction-coherent session clock.
-    energy = Math.max(0, energy - ENERGY_DRAIN_PER_TICK);
+    // The energy clock pauses while resting — the breather is the operator's time.
+    if (!resting) energy = Math.max(0, energy - ENERGY_DRAIN_PER_TICK);
     if (energy <= 0) {
       await convex.mutation(api.session.pushEvent, {
         sessionId,
@@ -353,18 +822,19 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
       sessionId,
       tick,
       synchro,
-      entities: world.fighters.map((f) => ({
-        entityId: f.id,
-        kind: f.kind,
-        name: f.name,
-        x: f.pos.x,
-        y: f.pos.y,
-        z: f.pos.z,
-        pose: f.pose,
-        hp: f.hp,
-        maxHp: f.maxHp,
-        element: f.element,
-      })),
+      // Corpses get 1 second of "down" pose so the death reads, then vanish.
+      entities: visibleFighters(world.fighters, downAt, tick).map((f) => ({
+          entityId: f.id,
+          kind: f.kind,
+          name: f.name,
+          x: f.pos.x,
+          y: f.pos.y,
+          z: f.pos.z,
+          pose: f.pose,
+          hp: f.hp,
+          maxHp: f.maxHp,
+          element: f.element,
+        })),
     });
 
     // 5. L2 heartbeat, slow cadence: the agent comments on the fight.
