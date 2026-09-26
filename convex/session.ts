@@ -35,6 +35,40 @@ export const getActive = query({
       .first(),
 });
 
+/**
+ * Resolve a pasted id. Operators copy either the agent id from compile
+ * or the session id the director prints — both should find the dive.
+ */
+export const findDive = query({
+  args: { id: v.string() },
+  returns: v.object({
+    sessionId: v.union(v.id("sessions"), v.null()),
+    error: v.union(v.string(), v.null()),
+  }),
+  handler: async (ctx, { id }) => {
+    const trimmed = id.trim();
+    const agentId = ctx.db.normalizeId("agents", trimmed);
+    if (agentId) {
+      const session = await ctx.db
+        .query("sessions")
+        .withIndex("by_agent_status", (q) => q.eq("agentId", agentId).eq("status", "active"))
+        .first();
+      return { sessionId: session?._id ?? null, error: null };
+    }
+    const sessionId = ctx.db.normalizeId("sessions", trimmed);
+    if (sessionId) {
+      const session = await ctx.db.get(sessionId);
+      if (!session) return { sessionId: null, error: "No dive found for that session id." };
+      return { sessionId: session._id, error: null };
+    }
+    return {
+      sessionId: null,
+      error:
+        "That id isn't an agent or a session. Paste the agent id from agents:compile (also AGENT_ID in the director .env), not a random string.",
+    };
+  },
+});
+
 /** Operator sends an intent — command, script slot, destination, chat. */
 export const sendIntent = mutation({
   args: {

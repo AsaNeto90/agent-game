@@ -219,46 +219,124 @@ function Hud({ sessionId }: { sessionId: Id<"sessions"> }) {
   );
 }
 
-function App() {
-  const [agentId, setAgentId] = useState("");
-  const [sessionId, setSessionId] = useState<Id<"sessions"> | null>(null);
-  const startDive = useMutation(api.session.start);
+const panelStyle: React.CSSProperties = {
+  padding: 32,
+  fontFamily: "monospace",
+  color: "#cfe3ff",
+  background: "#05070f",
+  minHeight: "100vh",
+  boxSizing: "border-box",
+};
 
-  if (!sessionId) {
+/**
+ * Session discovery. The director owns the dive; the client just finds it.
+ * - director running  -> subscribe to its live session
+ * - nothing diving    -> say so, instead of rendering an empty void
+ */
+function DiveConsole({ diveId, onReset }: { diveId: string; onReset: () => void }) {
+  const result = useQuery(api.session.findDive, { id: diveId });
+
+  if (result === undefined) {
     return (
-      <div style={{ padding: 32, fontFamily: "monospace" }}>
+      <div style={panelStyle}>
         <h2>DIVE CONSOLE</h2>
-        <p>Paste an agent id (compile one first: <code>npx convex run agents:compile</code>), then dive.</p>
-        <input
-          value={agentId}
-          onChange={(e) => setAgentId(e.target.value)}
-          placeholder="agent id"
-          style={{ width: 320 }}
-        />
-        <button
-          onClick={async () => {
-            const id = await startDive({ agentId: agentId as Id<"agents">, zoneId: "tide-district" });
-            setSessionId(id);
-          }}
-        >
-          Dive into cyberspace
-        </button>
+        <p>Contacting cyberspace…</p>
+      </div>
+    );
+  }
+
+  if (result.error) {
+    return (
+      <div style={panelStyle}>
+        <h2>CAN'T FIND THAT DIVE</h2>
+        <p>{result.error}</p>
+        <button onClick={onReset}>Try another id</button>
+      </div>
+    );
+  }
+
+  if (result.sessionId === null) {
+    return (
+      <div style={panelStyle}>
+        <h2>NO ACTIVE DIVE</h2>
+        <p>This agent isn't diving right now. The director — the brain's heartbeat — needs to be running:</p>
+        <p>
+          <code style={{ background: "#122", padding: "4px 8px" }}>
+            pnpm --filter @agent-game/director dev
+          </code>
+        </p>
+        <p>Start it and this screen will connect on its own. Either boot order works.</p>
+        <button onClick={onReset}>Try another id</button>
+      </div>
+    );
+  }
+
+  return <DiveScreen key={result.sessionId} sessionId={result.sessionId} />;
+}
+
+function DiveScreen({ sessionId }: { sessionId: Id<"sessions"> }) {
+  const snapshot = useQuery(api.session.snapshot, { sessionId });
+
+  if (snapshot && snapshot.status !== "active") {
+    return (
+      <div style={panelStyle}>
+        <h2>{snapshot.status === "resting" ? "AGENT RESTING" : "DIVE ENDED"}</h2>
+        <p>
+          {snapshot.status === "resting"
+            ? "Your agent is recharging. Restart the director to dive again."
+            : "This dive is over. Restart the director to open a new session."}
+        </p>
       </div>
     );
   }
 
   return (
-    <ConvexProvider client={convex}>
-      <div style={{ display: "flex", height: "100vh", background: "#05070f", color: "#cfe3ff", fontFamily: "monospace" }}>
-        <div style={{ flex: 3 }}>
-          <DiveView sessionId={sessionId} />
-        </div>
-        <div style={{ flex: 1, borderLeft: "1px solid #1a3a5c", minWidth: 300 }}>
-          <Hud sessionId={sessionId} />
-        </div>
+    <div
+      style={{
+        display: "flex",
+        height: "100vh",
+        background: "#05070f",
+        color: "#cfe3ff",
+        fontFamily: "monospace",
+      }}
+    >
+      <div style={{ flex: 3 }}>
+        <DiveView sessionId={sessionId} />
       </div>
-    </ConvexProvider>
+      <div style={{ flex: 1, borderLeft: "1px solid #1a3a5c", minWidth: 300 }}>
+        <Hud sessionId={sessionId} />
+      </div>
+    </div>
   );
+}
+
+function App() {
+  const [input, setInput] = useState("");
+  const [diveId, setDiveId] = useState<string | null>(null);
+
+  if (!diveId) {
+    return (
+      <div style={panelStyle}>
+        <h2>DIVE CONSOLE</h2>
+        <p>
+          Paste an agent id (compile one first:{" "}
+          <code>{`npx convex run agents:compile '{"name":"AstroMan","ext":"PY"}'`}</code>
+          ) or the session id the director prints, then dive.
+        </p>
+        <input
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder="agent id or session id"
+          style={{ width: 320, marginRight: 8 }}
+        />
+        <button onClick={() => input.trim() && setDiveId(input.trim())}>
+          Find dive
+        </button>
+      </div>
+    );
+  }
+
+  return <DiveConsole diveId={diveId} onReset={() => setDiveId(null)} />;
 }
 
 createRoot(document.getElementById("root")!).render(

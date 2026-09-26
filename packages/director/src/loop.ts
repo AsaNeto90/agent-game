@@ -22,15 +22,25 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
   const convex = new ConvexHttpClient(cfg.convexUrl);
   const rand = rng(Date.now() % 2 ** 31);
 
-  // Boot: agent record + active session.
+  // Boot: agent record + attach to the live dive (or start one).
+  // Either boot order works: director-first creates the session, client-first
+  // leaves one for the director to adopt. One session per agent, always.
   const agent = await convex.query(api.agents.get, {
     agentId: cfg.agentId as Id<"agents">,
   });
   if (!agent) throw new Error(`agent ${cfg.agentId} not found — compile one first (agents:compile)`);
-  const sessionId = (await convex.mutation(api.session.start, {
+  const existingSession = await convex.query(api.session.getActive, {
     agentId: cfg.agentId as Id<"agents">,
-    zoneId: cfg.zoneId,
-  })) as Id<"sessions">;
+  });
+  const isNewSession = !existingSession;
+  const sessionId = (
+    existingSession?._id ??
+    (await convex.mutation(api.session.start, {
+      agentId: cfg.agentId as Id<"agents">,
+      zoneId: cfg.zoneId,
+    }))
+  ) as Id<"sessions">;
+  if (!isNewSession) console.log(`[director] adopted live session ${sessionId}`);
 
   // Spawn: agent at origin, two starter viruses ahead.
   const world: WorldState = { fighters: [], events: [] };
@@ -91,24 +101,36 @@ export async function runDirector(cfg: DirectorConfig): Promise<() => void> {
   };
 
   await trace("L2", "dive_start", `${agent.name}.${agent.ext} dove into ${cfg.zoneId}`, 0);
-  await convex.mutation(api.session.pushEvent, {
-    sessionId,
-    tick,
-    event: {
-      type: "dialogue",
-      speaker: `${agent.name}.${agent.ext}`,
-      text: await cfg.mind.speak(
-        {
-          agentName: agent.name,
-          agentExt: agent.ext,
-          bondTier: agent.bondTier,
-          recentMemories: [],
-          situation: "dive start",
-        },
-        "dive start",
-      ),
-    },
-  });
+  if (isNewSession) {
+    await convex.mutation(api.session.pushEvent, {
+      sessionId,
+      tick,
+      event: {
+        type: "dialogue",
+        speaker: `${agent.name}.${agent.ext}`,
+        text: await cfg.mind.speak(
+          {
+            agentName: agent.name,
+            agentExt: agent.ext,
+            bondTier: agent.bondTier,
+            recentMemories: [],
+            situation: "dive start",
+          },
+          "dive start",
+        ),
+      },
+    });
+  } else {
+    await convex.mutation(api.session.pushEvent, {
+      sessionId,
+      tick,
+      event: {
+        type: "dialogue",
+        speaker: `${agent.name}.${agent.ext}`,
+        text: `Director reconnected — I'm still here, operator.`,
+      },
+    });
+  }
 
   const timer = setInterval(async () => {
     if (!running) return;
